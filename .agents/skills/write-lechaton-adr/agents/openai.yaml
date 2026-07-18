@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write LeChaton ADR"
+  short_description: "Create and register LeChaton architecture ADRs"
+  default_prompt: "Use $write-lechaton-adr to document a durable LeChaton architecture decision and register it for future work."
