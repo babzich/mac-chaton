@@ -1,0 +1,128 @@
+import ProjectDescription
+
+let sharedSettings: Settings = .settings(
+    base: [
+        "ARCHS": "arm64",
+        "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path @executable_path/Frameworks",
+        "ONLY_ACTIVE_ARCH": "YES",
+        "SWIFT_STRICT_CONCURRENCY": "complete",
+        "SWIFT_VERSION": "6.0",
+    ]
+)
+
+let appSettings: Settings = .settings(
+    base: [
+        "ARCHS": "arm64",
+        "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
+        "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path @executable_path/Frameworks",
+        "ONLY_ACTIVE_ARCH": "YES",
+        "SWIFT_STRICT_CONCURRENCY": "complete",
+        "SWIFT_VERSION": "6.0",
+    ]
+)
+
+let project = Project(
+    name: "LeChaton",
+    organizationName: "vincentbach",
+    options: .options(
+        automaticSchemesOptions: .disabled,
+        developmentRegion: "en"
+    ),
+    settings: sharedSettings,
+    targets: [
+        .target(
+            name: "LeChatonCore",
+            destinations: .macOS,
+            product: .framework,
+            bundleId: "com.vincentbach.LeChatonCore",
+            deploymentTargets: .macOS("26.0"),
+            infoPlist: .default,
+            sources: ["Sources/LeChatonCore/**"],
+            dependencies: [
+                .external(name: "GRDB"),
+            ],
+            settings: sharedSettings
+        ),
+        .target(
+            name: "LeChaton",
+            destinations: .macOS,
+            product: .app,
+            bundleId: "com.vincentbach.LeChaton",
+            deploymentTargets: .macOS("26.0"),
+            infoPlist: .extendingDefault(with: [
+                "CFBundleDisplayName": "LeChaton",
+                "LSApplicationCategoryType": "public.app-category.developer-tools",
+                "LSMinimumSystemVersion": "26.0",
+                "NSHighResolutionCapable": true,
+                "NSPrincipalClass": "NSApplication",
+            ]),
+            sources: ["Sources/LeChaton/**"],
+            resources: ["Sources/LeChaton/Resources/**"],
+            dependencies: [
+                .target(name: "LeChatonCore"),
+            ],
+            settings: appSettings
+        ),
+        .target(
+            name: "ACPProbe",
+            destinations: .macOS,
+            product: .commandLineTool,
+            bundleId: "com.vincentbach.ACPProbe",
+            deploymentTargets: .macOS("26.0"),
+            infoPlist: .default,
+            sources: ["Sources/ACPProbe/**"],
+            dependencies: [
+                .target(name: "LeChatonCore"),
+            ],
+            settings: sharedSettings
+        ),
+        .target(
+            name: "FakeACPAgent",
+            destinations: .macOS,
+            product: .commandLineTool,
+            bundleId: "com.vincentbach.FakeACPAgent",
+            deploymentTargets: .macOS("26.0"),
+            infoPlist: .default,
+            sources: ["Sources/FakeACPAgent/**"],
+            dependencies: [
+                .target(name: "LeChatonCore"),
+            ],
+            settings: sharedSettings
+        ),
+        .target(
+            name: "LeChatonTests",
+            destinations: .macOS,
+            product: .unitTests,
+            bundleId: "com.vincentbach.LeChatonTests",
+            deploymentTargets: .macOS("26.0"),
+            infoPlist: .default,
+            sources: ["Tests/LeChatonTests/**"],
+            dependencies: [
+                .target(name: "LeChatonCore"),
+                .target(name: "FakeACPAgent"),
+            ],
+            settings: sharedSettings
+        ),
+    ],
+    schemes: [
+        .scheme(
+            name: "LeChaton",
+            shared: true,
+            buildAction: .buildAction(targets: ["LeChaton"]),
+            testAction: .targets(["LeChatonTests"]),
+            runAction: .runAction(executable: "LeChaton")
+        ),
+        .scheme(
+            name: "ACPProbe",
+            shared: true,
+            buildAction: .buildAction(targets: ["ACPProbe"]),
+            runAction: .runAction(executable: "ACPProbe")
+        ),
+        .scheme(
+            name: "FakeACPAgent",
+            shared: true,
+            buildAction: .buildAction(targets: ["FakeACPAgent"]),
+            runAction: .runAction(executable: "FakeACPAgent")
+        ),
+    ]
+)

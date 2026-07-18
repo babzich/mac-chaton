@@ -7,6 +7,10 @@
 - [Technical Specification](./technical-spec.md) - long-term architecture and implementation direction.
 - [Vibe ACP Issues](./vibe-acp-issues.md) - confirmed upstream constraints and validation risks.
 
+## Compatibility Evidence
+
+- [Vibe 2.21.0 Live Gate](./compatibility/vibe-2.21.0-live-gate.md) - sanitized evidence for replay ordering, configuration restoration, and descendant cleanup.
+
 ## Architecture Decisions
 
 ADRs contain durable, agent-facing boundaries. Implementation constants, wire details, and demo procedures remain in the specifications.
@@ -27,5 +31,6 @@ Every ADR declares a date, scope, and lifecycle status:
 | State, concurrency, cancellation, and runtime ownership | [0003 State And Concurrency Ownership](./adr/0003-state-and-concurrency-ownership.md) |
 | ACP, Vibe, Git, credentials, subprocesses, trust, and compatibility | [0004 External Integration Boundaries](./adr/0004-external-integration-boundaries.md) |
 | Tuist, build/run workflow, and validation strategy | [0005 Project Generation And Validation](./adr/0005-project-generation-and-validation.md) |
+| Persistence ownership, migrations, durable metadata, session restoration, and database recovery | [0006 Persistence And Session Restoration](./adr/0006-persistence-and-session-restoration.md) |
 
 Use the repository-local Codex skill `$write-lechaton-adr` to create or update an ADR and register it in both indexes.
