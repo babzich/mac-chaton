@@ -12,6 +12,48 @@ public struct KnownGoodSnapshot: Equatable, Sendable {
     }
 }
 
+public struct ThreadPresentation: Equatable, Identifiable, Sendable {
+    public let id: UUID
+    public let title: String
+    public let cwd: String
+    public let vibeSessionID: String
+    public let isProvisional: Bool
+
+    public init(
+        id: UUID,
+        title: String,
+        cwd: String,
+        vibeSessionID: String,
+        isProvisional: Bool
+    ) {
+        self.id = id
+        self.title = title
+        self.cwd = cwd
+        self.vibeSessionID = vibeSessionID
+        self.isProvisional = isProvisional
+    }
+
+    public init(saved metadata: SavedThreadMetadata) {
+        self.init(
+            id: metadata.thread.id,
+            title: metadata.thread.title,
+            cwd: metadata.environment.cwd,
+            vibeSessionID: metadata.thread.vibeSessionID,
+            isProvisional: false
+        )
+    }
+
+    public init(provisional request: CreateThreadRequest) {
+        self.init(
+            id: request.threadID,
+            title: request.title,
+            cwd: request.repositoryURL.path,
+            vibeSessionID: request.vibeSessionID,
+            isProvisional: true
+        )
+    }
+}
+
 public struct PendingPermission: Equatable, Identifiable, Sendable {
     public let request: PermissionRequest
 
@@ -57,6 +99,8 @@ public struct ExecutableCandidatePresentation: Equatable, Sendable {
 
 public enum SessionRecoveryAction: String, Equatable, Hashable, Sendable {
     case retry
+    case retryThreadSave
+    case discardDraftThread
     case resetRuntime
     case removeSavedThread
     case retryCleanup
@@ -72,6 +116,7 @@ public struct SessionModelIssue: Equatable, Sendable {
     public enum Kind: String, Equatable, Sendable {
         case runtime
         case persistence
+        case savedSessionUnavailable
         case repositoryUnavailable
         case authenticationRequired
         case trustRequired

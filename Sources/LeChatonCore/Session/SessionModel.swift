@@ -6,6 +6,7 @@ import Observation
 public final class SessionModel {
     public private(set) var lifecycle: SessionLifecycle = .unloaded
     public private(set) var selectedThread: SavedThreadMetadata?
+    public private(set) var provisionalThread: ThreadPresentation?
     public private(set) var selectedVibePath: String?
     public private(set) var sessionState = SessionState()
     public private(set) var knownGoodSnapshot: KnownGoodSnapshot?
@@ -21,7 +22,7 @@ public final class SessionModel {
     public private(set) var lastRecoveryBackupURL: URL?
 
     public var canResume: Bool {
-        guard selectedThread != nil else { return false }
+        guard selectedThread != nil, provisionalThread == nil else { return false }
         return switch lifecycle {
         case .unloaded, .reloadRequired, .failed: true
         default: false
@@ -29,6 +30,10 @@ public final class SessionModel {
     }
 
     public var canPrompt: Bool { lifecycle == .idle && activeRuntime?.sessionID != nil }
+    public var threadPresentation: ThreadPresentation? {
+        provisionalThread ?? selectedThread.map { ThreadPresentation(saved: $0) }
+    }
+    public var hasProvisionalThread: Bool { provisionalThread != nil }
     public var hasPendingRepositoryTrustAction: Bool { pendingTrustAction != nil }
     public var hasPendingCleanup: Bool {
         pendingRuntimeCleanup != nil || pendingAuthCleanup != nil || pendingCandidateCleanup != nil
@@ -45,6 +50,7 @@ public final class SessionModel {
     @ObservationIgnored private var provisionalCandidateOwner: (any SessionAuthenticationCandidate)?
     @ObservationIgnored private var authenticationPromotionOperation: AuthenticationPromotionOperation?
     @ObservationIgnored private var repositoryValidationOperation: RepositoryValidationOperation?
+    @ObservationIgnored private var providerActivationOperation: ProviderActivationOperation?
     @ObservationIgnored private var updateTask: Task<Void, Never>?
     @ObservationIgnored private var requestTask: Task<Void, Never>?
     @ObservationIgnored private var diagnosticTask: Task<Void, Never>?
@@ -58,6 +64,7 @@ public final class SessionModel {
     @ObservationIgnored private var candidateCleanupOperation: CleanupOperation?
     @ObservationIgnored private var cleanupSuccessLifecycle: SessionLifecycle = .unloaded
     @ObservationIgnored private var pendingTrustAction: PendingTrustAction?
+    @ObservationIgnored private var pendingThreadCommit: PendingThreadCommit?
     @ObservationIgnored private var isShuttingDown = false
     @ObservationIgnored private var shutdownInProgress = false
     @ObservationIgnored private var shutdownSucceeded = false
@@ -77,6 +84,11 @@ public final class SessionModel {
     private struct RepositoryValidationOperation: Sendable {
         let id: UUID
         let task: Task<CanonicalRepository, any Error>
+    }
+
+    private struct ProviderActivationOperation: Sendable {
+        let id: UUID
+        let task: Task<Void, any Error>
     }
 
     private struct ActiveRuntime: Sendable {
@@ -107,6 +119,16 @@ public final class SessionModel {
         case replace(repositoryURL: URL, title: String)
     }
 
+    private struct PendingThreadCommit: Sendable {
+        enum Mode: Sendable {
+            case create
+            case replace(previousThreadID: UUID)
+        }
+
+        let request: CreateThreadRequest
+        let mode: Mode
+    }
+
     public init(dependencies: SessionModelDependencies) {
         self.dependencies = dependencies
     }
@@ -114,13 +136,85 @@ public final class SessionModel {
     public convenience init(
         store: PersistenceStore,
         adapter: VibeAdapter = VibeAdapter(),
-        neutralApplicationSupportURL: URL
+        neutralApplicationSupportURL: URL,
+        providerRuntimeEnvironment: @escaping @Sendable () async throws -> ProviderRuntimeEnvironment? = { nil },
+        activateProviderModel: @escaping @Sendable (UUID, UUID) async throws -> Void = { _, _ in }
     ) {
         self.init(dependencies: .live(
             store: store,
             adapter: adapter,
-            neutralApplicationSupportURL: neutralApplicationSupportURL
+            neutralApplicationSupportURL: neutralApplicationSupportURL,
+            providerRuntimeEnvironment: providerRuntimeEnvironment,
+            activateProviderModel: activateProviderModel
         ))
+    }
+
+    public func activateProviderModel(providerID: UUID, modelID: UUID) async throws {
+        try ensureOperational()
+        guard pendingThreadCommit == nil else {
+            throw SessionModelError.invalidLifecycle(
+                expected: "a saved Thread; discard the draft first",
+                actual: lifecycle
+            )
+        }
+        guard lifecycle == .unloaded || lifecycle == .idle else {
+            throw SessionModelError.invalidLifecycle(
+                expected: "Unloaded or Idle",
+                actual: lifecycle
+            )
+        }
+
+        lifecycle = .switchingProvider
+        activity = "Activating provider model"
+        issue = nil
+
+        let sessionOwner = invalidateRuntime(clearPresentation: true) ?? provisionalRuntimeOwner
+        provisionalRuntimeOwner = nil
+        let oldAuthOwner = authOwner
+        authOwner = nil
+        authOwnerExecutablePath = nil
+        authentication = .unknown
+        currentAuthenticationAttempt = nil
+
+        if let cleanupError = await disposeOwners(
+            session: sessionOwner,
+            authentication: oldAuthOwner,
+            candidate: nil
+        ) {
+            guard !isShuttingDown else { throw SessionModelError.shuttingDown }
+            lifecycle = .cleanupRequired
+            activity = nil
+            issue = cleanupIssue(cleanupError)
+            throw cleanupError
+        }
+
+        do {
+            try ensureOperational()
+            let operationID = dependencies.makeUUID()
+            let activate = dependencies.activateProviderModel
+            let task = Task {
+                try Task.checkCancellation()
+                try await activate(providerID, modelID)
+            }
+            providerActivationOperation = .init(id: operationID, task: task)
+            try await task.value
+            try ensureOperational()
+            guard providerActivationOperation?.id == operationID else {
+                throw SessionModelError.staleRuntime
+            }
+            providerActivationOperation = nil
+            clearRuntimePresentation(keepKnownGood: false)
+            lifecycle = .unloaded
+            activity = nil
+        } catch {
+            providerActivationOperation = nil
+            if !isShuttingDown {
+                clearRuntimePresentation(keepKnownGood: false)
+                lifecycle = .unloaded
+                activity = nil
+            }
+            throw error
+        }
     }
 
     /// Restores only app-owned metadata. No Vibe, auth, or candidate process is created here.
@@ -133,6 +227,8 @@ public final class SessionModel {
             let snapshot = try await dependencies.persistence.restoreMetadata()
             guard !isShuttingDown else { return }
             selectedThread = snapshot.selectedThread
+            provisionalThread = nil
+            pendingThreadCommit = nil
             selectedVibePath = snapshot.settings.selectedVibePath
             lifecycle = .unloaded
             clearRuntimePresentation(keepKnownGood: false)
@@ -231,46 +327,9 @@ public final class SessionModel {
                 vibeSessionID: result.sessionID,
                 title: title
             )
-            let metadata: SavedThreadMetadata
-            do {
-                metadata = try await dependencies.persistence.createThread(request)
-                try ensureOperational()
-            } catch {
-                guard !isShuttingDown else { return }
-                let owner = invalidateRuntime(clearPresentation: true)
-                try await stopVerified(owner)
-                guard !isShuttingDown else { return }
-                lifecycle = .unloaded
-                issue = .init(
-                    kind: .persistence,
-                    title: "Thread was not saved",
-                    message: "The Vibe session was created but local metadata failed to commit. An unreachable Vibe-side session may remain. \(error)",
-                    actions: [.retry]
-                )
-                activity = nil
-                return
-            }
-
-            // The transaction is authoritative from this point onward, even if the candidate
-            // runtime failed while the database actor was committing.
-            selectedThread = metadata
-            guard activeRuntime?.id == runtime.id else {
-                let owner = invalidateRuntime(clearPresentation: true)
-                do {
-                    try await stopVerified(owner)
-                    guard !isShuttingDown else { return }
-                    lifecycle = .failed(SessionModelError.staleRuntime.description)
-                    issue = runtimeIssue(SessionModelError.staleRuntime)
-                } catch {
-                    guard !isShuttingDown else { return }
-                    cleanupSuccessLifecycle = .unloaded
-                    lifecycle = .cleanupRequired
-                    issue = cleanupIssue(error)
-                }
-                activity = nil
-                return
-            }
             activeRuntime?.sessionID = result.sessionID
+            pendingThreadCommit = .init(request: request, mode: .create)
+            provisionalThread = .init(provisional: request)
             reducer.reset()
             sessionState = reducer.state
             configurationOptions = decodedOptions
@@ -407,6 +466,7 @@ public final class SessionModel {
 
     public func replaceSavedThread(repositoryURL: URL, title: String) async {
         guard !isShuttingDown else { return }
+        guard pendingThreadCommit == nil else { return }
         guard let oldMetadata = selectedThread else {
             await createThread(repositoryURL: repositoryURL, title: title)
             return
@@ -461,51 +521,14 @@ public final class SessionModel {
                 vibeSessionID: newSession.sessionID,
                 title: title
             )
-
-            let replacement: SavedThreadMetadata
-            do {
-                replacement = try await dependencies.persistence.replaceSelectedThread(
-                    oldMetadata.thread.id,
-                    request
-                )
-                try ensureOperational()
-            } catch {
-                guard !isShuttingDown else { return }
-                let owner = invalidateRuntime(clearPresentation: true)
-                try await stopVerified(owner)
-                guard !isShuttingDown else { return }
-                selectedThread = oldMetadata
-                lifecycle = .unloaded
-                issue = .init(
-                    kind: .persistence,
-                    title: "Replacement was not committed",
-                    message: "The original Thread remains selected and can be resumed. \(error)",
-                    actions: [.retry, .removeSavedThread]
-                )
-                activity = nil
-                return
-            }
-
-            // Replacement metadata is authoritative after the transaction returns. Never
-            // restore the deleted old Thread in memory after this edge.
-            selectedThread = replacement
-            guard activeRuntime?.id == runtime.id else {
-                let owner = invalidateRuntime(clearPresentation: true)
-                do {
-                    try await stopVerified(owner)
-                    guard !isShuttingDown else { return }
-                    lifecycle = .failed(SessionModelError.staleRuntime.description)
-                    issue = runtimeIssue(SessionModelError.staleRuntime)
-                } catch {
-                    guard !isShuttingDown else { return }
-                    cleanupSuccessLifecycle = .unloaded
-                    lifecycle = .cleanupRequired
-                    issue = cleanupIssue(error)
-                }
-                activity = nil
-                return
-            }
             activeRuntime?.sessionID = newSession.sessionID
+            pendingThreadCommit = .init(
+                request: request,
+                mode: .replace(previousThreadID: oldMetadata.thread.id)
+            )
+            provisionalThread = .init(provisional: request)
+            reducer.reset()
+            sessionState = reducer.state
             configurationOptions = decodedOptions
             configurationState = .effectiveFromVibe
             lifecycle = .idle
@@ -558,6 +581,15 @@ public final class SessionModel {
                 reducer.finishPrompt(failed: false)
                 sessionState = reducer.state
                 pendingPermissions.removeAll()
+                if pendingThreadCommit != nil {
+                    // The prompt response has arrived, so cancellation is no longer valid.
+                    // Keep the UI non-interactive while durability confirmation and the
+                    // metadata commit cross actor boundaries.
+                    lifecycle = .replacingThread
+                    await commitProvisionalThreadIfDurable(runtime: runtime)
+                    try ensureOperational()
+                    guard activeRuntime?.id == runtime.id else { throw SessionModelError.staleRuntime }
+                }
                 lifecycle = .idle
                 activity = nil
             }
@@ -567,6 +599,7 @@ public final class SessionModel {
             if lifecycle == .cancelling { throw error }
             reducer.finishPrompt(failed: true)
             sessionState = reducer.state
+            clearProvisionalThread()
             await handleRuntimeFailure(error, preserveKnownGood: false)
             throw error
         }
@@ -626,6 +659,13 @@ public final class SessionModel {
 
     public func unload() async {
         guard !isShuttingDown else { return }
+        guard pendingThreadCommit == nil else {
+            issue = runtimeIssue(SessionModelError.invalidLifecycle(
+                expected: "a saved Thread; discard the draft first",
+                actual: lifecycle
+            ))
+            return
+        }
         guard lifecycle == .idle || lifecycle == .unloaded || lifecycle == .reloadRequired || isFailed(lifecycle) else { return }
         lifecycle = .replacingThread
         activity = "Stopping Vibe"
@@ -647,6 +687,51 @@ public final class SessionModel {
     public func resetRuntime() async {
         guard !isShuttingDown else { return }
         await unload()
+    }
+
+    public func retryThreadSave() async {
+        guard !isShuttingDown, lifecycle == .idle,
+              let runtime = activeRuntime, pendingThreadCommit != nil
+        else { return }
+
+        issue = nil
+        lifecycle = .replacingThread
+        activity = "Checking Vibe session durability"
+        await commitProvisionalThreadIfDurable(runtime: runtime)
+        guard !isShuttingDown,
+              activeRuntime?.id == runtime.id,
+              lifecycle == .replacingThread
+        else { return }
+        lifecycle = .idle
+        activity = nil
+    }
+
+    public func discardDraftThread() async {
+        guard !isShuttingDown, pendingThreadCommit != nil else { return }
+        guard lifecycle == .idle || isFailed(lifecycle) else {
+            issue = runtimeIssue(SessionModelError.invalidLifecycle(
+                expected: "Idle or Failed",
+                actual: lifecycle
+            ))
+            return
+        }
+
+        lifecycle = .replacingThread
+        activity = "Discarding draft Thread"
+        let owner = invalidateRuntime(clearPresentation: true)
+        clearProvisionalThread()
+        do {
+            try await stopVerified(owner)
+            guard !isShuttingDown else { return }
+            lifecycle = .unloaded
+            issue = nil
+        } catch {
+            guard !isShuttingDown else { return }
+            cleanupSuccessLifecycle = .unloaded
+            lifecycle = .cleanupRequired
+            issue = cleanupIssue(error)
+        }
+        activity = nil
     }
 
     public func retryCleanup() async {
@@ -711,6 +796,7 @@ public final class SessionModel {
 
     public func removeSavedThread() async {
         guard !isShuttingDown else { return }
+        guard pendingThreadCommit == nil else { return }
         // Metadata removal cannot bypass a retained process owner. Keep the
         // mandatory Retry Cleanup / Quit issue intact until cleanup succeeds.
         guard !hasPendingCleanup,
@@ -758,7 +844,8 @@ public final class SessionModel {
 
     public func applyConfiguration(optionID: String, value: JSONValue) async {
         guard !isShuttingDown else { return }
-        guard lifecycle == .idle,
+        guard pendingThreadCommit == nil,
+              lifecycle == .idle,
               let runtime = activeRuntime,
               let sessionID = runtime.sessionID,
               let option = configurationOptions.first(where: { $0.id == optionID })
@@ -926,6 +1013,13 @@ public final class SessionModel {
 
     public func validateExecutableCandidate(_ candidateURL: URL) async {
         guard !isShuttingDown else { return }
+        guard pendingThreadCommit == nil else {
+            issue = runtimeIssue(SessionModelError.invalidLifecycle(
+                expected: "a saved Thread; discard the draft first",
+                actual: lifecycle
+            ))
+            return
+        }
         guard lifecycle == .unloaded || lifecycle == .idle || lifecycle == .swapFailed else {
             issue = runtimeIssue(SessionModelError.invalidLifecycle(
                 expected: "Unloaded, Idle, or Swap Failed",
@@ -956,7 +1050,7 @@ public final class SessionModel {
                 candidateContext = nil
                 executableCandidate = nil
             }
-            let owner = dependencies.makeAuthenticationCandidate(executable)
+            let owner = try await dependencies.makeAuthenticationCandidate(executable)
             validatingOwner = owner
             provisionalCandidateOwner = owner
             let snapshot = try await owner.refresh()
@@ -1058,6 +1152,7 @@ public final class SessionModel {
 
     public func commitExecutableCandidate() async {
         guard !isShuttingDown else { return }
+        guard pendingThreadCommit == nil else { return }
         guard let context = candidateContext else {
             issue = runtimeIssue(SessionModelError.noExecutableCandidate)
             return
@@ -1229,6 +1324,7 @@ public final class SessionModel {
                 guard !isShuttingDown else { return }
                 lastRecoveryBackupURL = result.backupDirectory
                 selectedThread = result.restoredSnapshot.selectedThread
+                clearProvisionalThread()
                 selectedVibePath = result.restoredSnapshot.settings.selectedVibePath
                 lifecycle = .unloaded
             } catch {
@@ -1258,6 +1354,13 @@ public final class SessionModel {
         validationOperation?.task.cancel()
         if let validationOperation {
             _ = await validationOperation.task.result
+        }
+
+        let providerOperation = providerActivationOperation
+        providerActivationOperation = nil
+        providerOperation?.task.cancel()
+        if let providerOperation {
+            _ = await providerOperation.task.result
         }
 
         let owners = detachAllOwners()
@@ -1293,6 +1396,7 @@ public final class SessionModel {
             issue = cleanupIssue(priorCleanupError ?? ownerCleanupError ?? promotionCleanupError!)
             succeeded = false
         }
+        activity = nil
         shutdownInProgress = false
         shutdownSucceeded = succeeded
         lastShutdownAttemptResult = succeeded
@@ -1393,7 +1497,7 @@ private extension SessionModel {
             try ensureOperational()
             guard activeRuntime?.id == active.id else { throw SessionModelError.staleRuntime }
             trust = .status(trustStatus)
-            guard trustStatus.state == .trusted else {
+            guard trustStatus.allowsSessionStart else {
                 let staleOwner = invalidateRuntime(clearPresentation: true)
                 try await stopVerified(staleOwner)
                 try ensureOperational()
@@ -1412,7 +1516,7 @@ private extension SessionModel {
 
     private func startRuntimeOwner(executable: VibeExecutable, cwd: URL) async throws -> ActiveRuntime {
         try ensureOperational()
-        let owner = dependencies.makeRuntime(executable, cwd)
+        let owner = try await dependencies.makeRuntime(executable, cwd)
         provisionalRuntimeOwner = owner
         do {
             let started = try await owner.start()
@@ -1444,7 +1548,7 @@ private extension SessionModel {
         if authOwnerExecutablePath != executable.url.path {
             if let authOwner { try await disposeAuthVerified(authOwner) }
             try ensureOperational()
-            authOwner = dependencies.makeAuthenticationOwner(executable)
+            authOwner = try await dependencies.makeAuthenticationOwner(executable)
             authOwnerExecutablePath = executable.url.path
             currentAuthenticationAttempt = nil
         }
@@ -1703,6 +1807,67 @@ private extension SessionModel {
 // MARK: - Disposal, failure, and presentation helpers
 
 private extension SessionModel {
+    private func commitProvisionalThreadIfDurable(runtime: ActiveRuntime) async {
+        guard let pending = pendingThreadCommit,
+              activeRuntime?.id == runtime.id,
+              runtime.sessionID == pending.request.vibeSessionID
+        else { return }
+
+        activity = "Checking Vibe session durability"
+        do {
+            let exists = try await runtime.owner.persistedSessionExists(
+                sessionID: pending.request.vibeSessionID,
+                cwd: pending.request.repositoryURL
+            )
+            try ensureOperational()
+            guard activeRuntime?.id == runtime.id,
+                  pendingThreadCommit?.request.threadID == pending.request.threadID
+            else { throw SessionModelError.staleRuntime }
+            guard exists else {
+                issue = .init(
+                    kind: .persistence,
+                    title: "Draft Thread is not saved yet",
+                    message: "Vibe has not listed this session yet. Send another persistence-producing prompt, retry the save, or discard the draft.",
+                    actions: [.retryThreadSave, .discardDraftThread]
+                )
+                return
+            }
+
+            activity = "Saving Thread metadata"
+            let metadata = switch pending.mode {
+            case .create:
+                try await dependencies.persistence.createThread(pending.request)
+            case let .replace(previousThreadID):
+                try await dependencies.persistence.replaceSelectedThread(
+                    previousThreadID,
+                    pending.request
+                )
+            }
+
+            // The transaction is authoritative once it returns, even if shutdown or
+            // runtime replacement won a race while the database actor was committing.
+            selectedThread = metadata
+            clearProvisionalThread()
+            if issue?.kind == .persistence { issue = nil }
+        } catch {
+            guard !isShuttingDown else { return }
+            guard activeRuntime?.id == runtime.id,
+                  pendingThreadCommit?.request.threadID == pending.request.threadID
+            else { return }
+            issue = .init(
+                kind: .persistence,
+                title: "Draft Thread is not saved yet",
+                message: "The current Vibe runtime remains usable, but LeChaton could not confirm and save its session metadata. \(error)",
+                actions: [.retryThreadSave, .discardDraftThread]
+            )
+        }
+    }
+
+    func clearProvisionalThread() {
+        pendingThreadCommit = nil
+        provisionalThread = nil
+    }
+
     func detachAllOwners() -> (
         session: (any SessionRuntime)?,
         authentication: (any SessionAuthenticationOwner)?,
@@ -1931,6 +2096,7 @@ private extension SessionModel {
         guard !handlingRuntimeFailure else { return }
         handlingRuntimeFailure = true
         defer { handlingRuntimeFailure = false }
+        clearProvisionalThread()
         await failLoadOrPreparation(error, preserveKnownGood: preserveKnownGood)
         activity = nil
     }
@@ -1970,6 +2136,16 @@ private extension SessionModel {
                 kind: .repositoryUnavailable,
                 title: "Repository unavailable",
                 message: String(describing: error),
+                actions: selectedThread == nil ? [] : [.retry, .removeSavedThread]
+            )
+        }
+        if let adapterError = error as? VibeAdapterError,
+           case let .savedSessionUnavailable(sessionID) = adapterError
+        {
+            return .init(
+                kind: .savedSessionUnavailable,
+                title: "Saved Vibe session unavailable",
+                message: "Vibe has no persisted session named \(sessionID). This can happen when an empty Thread is closed before its first conversation turn, or when Vibe’s session files are removed.",
                 actions: selectedThread == nil ? [] : [.retry, .removeSavedThread]
             )
         }

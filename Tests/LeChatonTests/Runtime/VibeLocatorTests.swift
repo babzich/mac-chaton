@@ -63,6 +63,7 @@ struct VibeLocatorTests {
             ),
             agentCapabilities: .object([
                 "loadSession": .bool(true),
+                "sessionCapabilities": .object(["list": .object([:])]),
                 "futureCapability": .object([:]),
             ]),
             authenticationMethods: [],
@@ -82,6 +83,18 @@ struct VibeLocatorTests {
         )
         #expect(throws: VibeCompatibilityError.self) {
             try VibeCompatibility(executable: executable, initialization: missingLoad)
+        }
+
+        let missingList = ACPInitializeResult(
+            protocolVersion: compatible.protocolVersion,
+            agentInfo: compatible.agentInfo,
+            agentCapabilities: .object(["loadSession": .bool(true)]),
+            authenticationMethods: compatible.authenticationMethods,
+            metadata: nil,
+            raw: .object([:])
+        )
+        #expect(throws: VibeCompatibilityError.self) {
+            try VibeCompatibility(executable: executable, initialization: missingList)
         }
 
         let wrongAgent = ACPInitializeResult(

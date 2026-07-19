@@ -3,6 +3,7 @@ import Foundation
 /// Vibe-specific protocol operations live here rather than leaking into ACP transport users.
 public struct VibeAdapter: Sendable {
     public static let delegatedAuthenticationMethodID = "browser-auth-delegated"
+    static let maximumSessionListPages = 32
 
     public let locator: VibeLocator
 
@@ -52,6 +53,62 @@ public struct VibeAdapter: Sendable {
             params: .object([:])
         )
         return VibeAuthenticationStatus(raw: raw)
+    }
+
+    /// Uses ACP's persisted-session listing rather than treating `session/new`
+    /// as a durability acknowledgement. Vibe may paginate this response.
+    public func persistedSessionExists(
+        sessionID: String,
+        cwd: URL,
+        transport: ACPTransport
+    ) async throws -> Bool {
+        var cursor: String?
+        var seenCursors: Set<String> = []
+        var pageCount = 0
+        let expectedCWD = cwd.standardizedFileURL.path
+
+        while true {
+            let page = try await transport.listSessions(cwd: cwd, cursor: cursor)
+            pageCount += 1
+            if page.sessions.contains(where: { session in
+                session.sessionID == sessionID
+                    && URL(filePath: session.cwd, directoryHint: .isDirectory)
+                        .standardizedFileURL.path == expectedCWD
+            }) {
+                return true
+            }
+
+            guard let nextCursor = page.nextCursor else { return false }
+            guard pageCount < Self.maximumSessionListPages else {
+                throw VibeAdapterError.sessionListPageLimitExceeded(
+                    maximumPages: Self.maximumSessionListPages
+                )
+            }
+            guard seenCursors.insert(nextCursor).inserted else {
+                throw VibeAdapterError.invalidSessionListPagination(nextCursor)
+            }
+            cursor = nextCursor
+        }
+    }
+
+    /// Maps only Vibe 2.21.0's exact missing-session response. Other ACP
+    /// failures retain their generic transport identity for defensive handling.
+    public func loadSession(
+        sessionID: String,
+        cwd: URL,
+        transport: ACPTransport
+    ) async throws -> LoadSessionResult {
+        do {
+            return try await transport.loadSession(sessionID: sessionID, cwd: cwd)
+        } catch let error as ACPTransportError {
+            let expected = JSONRPCErrorObject(
+                code: -32602,
+                message: "Session not found: \(sessionID)",
+                data: .object(["session_id": .string(sessionID)])
+            )
+            guard error == .responseError(expected) else { throw error }
+            throw VibeAdapterError.savedSessionUnavailable(sessionID)
+        }
     }
 
     /// Queries Vibe's repository-trust extension without teaching generic ACP about its shape.
@@ -265,6 +322,9 @@ public enum VibeAdapterError: Error, Equatable, Sendable, CustomStringConvertibl
     case invalidDelegatedAuthenticationCompletion
     case invalidConfigurationRequest
     case invalidConfigurationResponse
+    case invalidSessionListPagination(String)
+    case sessionListPageLimitExceeded(maximumPages: Int)
+    case savedSessionUnavailable(String)
     case unsupportedConfigurationOptionKind(String)
 
     public var description: String {
@@ -279,6 +339,12 @@ public enum VibeAdapterError: Error, Equatable, Sendable, CustomStringConvertibl
             "The Vibe configuration request is invalid"
         case .invalidConfigurationResponse:
             "Vibe returned an invalid configuration response"
+        case let .invalidSessionListPagination(cursor):
+            "Vibe repeated session/list cursor \(cursor)"
+        case let .sessionListPageLimitExceeded(maximumPages):
+            "Vibe session/list exceeded \(maximumPages) pages"
+        case let .savedSessionUnavailable(sessionID):
+            "Vibe has no persisted session matching \(sessionID)"
         case let .unsupportedConfigurationOptionKind(kind):
             "Vibe configuration option kind \(kind) is not writable"
         }
@@ -341,6 +407,22 @@ public struct VibeRepositoryTrustStatus: Equatable, Sendable {
     public let options: [JSONValue]
     public let details: JSONValue?
     public let raw: JSONValue
+
+    /// Vibe reports every undecided repository as `untrusted`, even when it
+    /// found no project-controlled files that require a trust decision. The
+    /// explicit `details: null` shape means the session may proceed with
+    /// project configuration excluded. Missing or malformed details remain
+    /// blocked defensively.
+    public var allowsSessionStart: Bool {
+        switch state {
+        case .trusted:
+            true
+        case .untrusted:
+            details == .null
+        case .unknown:
+            false
+        }
+    }
 
     public init(raw: JSONValue) {
         self.raw = raw

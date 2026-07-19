@@ -45,33 +45,29 @@ final class GitInspectionController {
     }
 
     @discardableResult
-    func refresh(repository: URL) async -> Bool {
+    func refreshCurrent(repository: URL) async -> Bool {
         guard let operationID = beginOperation(clearInspection: false) else { return false }
         let inspector = self.inspector
         let existingBaseline = baseline
         let operation = Task { @MainActor [weak self] in
-            let outcome: GitOperationOutcome<(GitStatusSnapshot, GitInspection)>
+            let outcome: GitOperationOutcome<(GitStatusSnapshot?, GitInspection)>
             do {
-                try Task.checkCancellation()
-                var baseline: GitStatusSnapshot
-                if let existingBaseline {
-                    baseline = existingBaseline
-                } else {
-                    baseline = try await inspector.captureBaseline(repository: repository)
-                }
                 try Task.checkCancellation()
                 let inspection: GitInspection
                 do {
-                    inspection = try await inspector.inspect(repository: repository, baseline: baseline)
+                    inspection = try await inspector.inspect(
+                        repository: repository,
+                        baseline: existingBaseline
+                    )
                 } catch let error as GitInspectionError {
-                    guard case .repositoryRootMismatch = error else { throw error }
+                    guard existingBaseline != nil,
+                          case .repositoryRootMismatch = error
+                    else { throw error }
                     try Task.checkCancellation()
-                    baseline = try await inspector.captureBaseline(repository: repository)
-                    try Task.checkCancellation()
-                    inspection = try await inspector.inspect(repository: repository, baseline: baseline)
+                    inspection = try await inspector.inspect(repository: repository, baseline: nil)
                 }
                 try Task.checkCancellation()
-                outcome = .success((baseline, inspection))
+                outcome = .success((inspection.baseline, inspection))
             } catch is CancellationError {
                 outcome = .cancelled
             } catch {
@@ -83,12 +79,21 @@ final class GitInspectionController {
         await operation.value
 
         guard acceptsOperations, self.operationID == operationID else { return false }
-        return baseline != nil
+        return inspection != nil
     }
 
     func clear() {
         cancelOperations()
         baseline = nil
+        inspection = nil
+        errorMessage = nil
+        isLoading = false
+    }
+
+    /// Cancels an in-flight current-state read before a prompt can mutate the
+    /// worktree, while retaining a baseline that was fully captured beforehand.
+    func discardInspection() {
+        cancelOperations()
         inspection = nil
         errorMessage = nil
         isLoading = false
@@ -155,7 +160,7 @@ final class GitInspectionController {
 
     private func completeInspection(
         operationID: UUID,
-        outcome: GitOperationOutcome<(GitStatusSnapshot, GitInspection)>
+        outcome: GitOperationOutcome<(GitStatusSnapshot?, GitInspection)>
     ) {
         operations.removeValue(forKey: operationID)
         guard acceptsOperations, self.operationID == operationID else { return }

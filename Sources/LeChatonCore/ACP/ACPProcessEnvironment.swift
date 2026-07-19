@@ -52,6 +52,17 @@ public enum ACPProcessEnvironment {
         return environment
     }
 
+    public static func sanitized(
+        inheriting inherited: [String: String] = ProcessInfo.processInfo.environment,
+        injecting provider: ProviderRuntimeEnvironment?
+    ) -> [String: String] {
+        var environment = sanitized(inheriting: inherited)
+        if let provider {
+            environment[provider.name] = provider.secret
+        }
+        return environment
+    }
+
     private static func setFallback(
         _ environment: inout [String: String],
         key: String,

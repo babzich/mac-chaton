@@ -21,6 +21,7 @@ public protocol SessionRuntime: Actor {
     func repositoryTrustStatus(cwd: URL) async throws -> VibeRepositoryTrustStatus
     func applyRepositoryTrustDecision(cwd: URL, decision: String) async throws -> VibeRepositoryTrustStatus
     func newSession(cwd: URL) async throws -> NewSessionResult
+    func persistedSessionExists(sessionID: String, cwd: URL) async throws -> Bool
     func loadSession(sessionID: String, cwd: URL) async throws -> LoadSessionResult
     func prompt(sessionID: String, text: String) async throws -> PromptResult
     func setConfigurationOption(
@@ -42,13 +43,20 @@ actor LiveSessionRuntime: SessionRuntime {
     private let adapter: VibeAdapter
     private let transport: ACPTransport
 
-    init(executable: VibeExecutable, workingDirectory: URL, adapter: VibeAdapter) {
+    init(
+        executable: VibeExecutable,
+        workingDirectory: URL,
+        adapter: VibeAdapter,
+        providerEnvironment: ProviderRuntimeEnvironment? = nil
+    ) {
         self.executable = executable
         self.workingDirectory = workingDirectory
         self.adapter = adapter
+        let environment = ACPProcessEnvironment.sanitized(injecting: providerEnvironment)
         transport = ACPTransport(configuration: .init(
             executableURL: executable.url,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            environment: environment
         ))
     }
 
@@ -101,8 +109,20 @@ actor LiveSessionRuntime: SessionRuntime {
         try await transport.newSession(cwd: cwd)
     }
 
+    func persistedSessionExists(sessionID: String, cwd: URL) async throws -> Bool {
+        try await adapter.persistedSessionExists(
+            sessionID: sessionID,
+            cwd: cwd,
+            transport: transport
+        )
+    }
+
     func loadSession(sessionID: String, cwd: URL) async throws -> LoadSessionResult {
-        try await transport.loadSession(sessionID: sessionID, cwd: cwd)
+        try await adapter.loadSession(
+            sessionID: sessionID,
+            cwd: cwd,
+            transport: transport
+        )
     }
 
     func prompt(sessionID: String, text: String) async throws -> PromptResult {
@@ -258,9 +278,10 @@ public struct SessionModelDependencies: Sendable {
     public var validateRepository: @Sendable (URL) async throws -> CanonicalRepository
     public var locateExecutable: @Sendable (String?) throws -> VibeExecutable
     public var validateExecutable: @Sendable (URL) throws -> VibeExecutable
-    public var makeRuntime: @Sendable (VibeExecutable, URL) -> any SessionRuntime
-    public var makeAuthenticationOwner: @Sendable (VibeExecutable) -> any SessionAuthenticationOwner
-    public var makeAuthenticationCandidate: @Sendable (VibeExecutable) -> any SessionAuthenticationCandidate
+    public var makeRuntime: @Sendable (VibeExecutable, URL) async throws -> any SessionRuntime
+    public var makeAuthenticationOwner: @Sendable (VibeExecutable) async throws -> any SessionAuthenticationOwner
+    public var makeAuthenticationCandidate: @Sendable (VibeExecutable) async throws -> any SessionAuthenticationCandidate
+    public var activateProviderModel: @Sendable (UUID, UUID) async throws -> Void
     public var makeUUID: @Sendable () -> UUID
 
     public init(
@@ -270,9 +291,10 @@ public struct SessionModelDependencies: Sendable {
         },
         locateExecutable: @escaping @Sendable (String?) throws -> VibeExecutable,
         validateExecutable: @escaping @Sendable (URL) throws -> VibeExecutable,
-        makeRuntime: @escaping @Sendable (VibeExecutable, URL) -> any SessionRuntime,
-        makeAuthenticationOwner: @escaping @Sendable (VibeExecutable) -> any SessionAuthenticationOwner,
-        makeAuthenticationCandidate: @escaping @Sendable (VibeExecutable) -> any SessionAuthenticationCandidate,
+        makeRuntime: @escaping @Sendable (VibeExecutable, URL) async throws -> any SessionRuntime,
+        makeAuthenticationOwner: @escaping @Sendable (VibeExecutable) async throws -> any SessionAuthenticationOwner,
+        makeAuthenticationCandidate: @escaping @Sendable (VibeExecutable) async throws -> any SessionAuthenticationCandidate,
+        activateProviderModel: @escaping @Sendable (UUID, UUID) async throws -> Void = { _, _ in },
         makeUUID: @escaping @Sendable () -> UUID = { UUID() }
     ) {
         self.persistence = persistence
@@ -282,13 +304,16 @@ public struct SessionModelDependencies: Sendable {
         self.makeRuntime = makeRuntime
         self.makeAuthenticationOwner = makeAuthenticationOwner
         self.makeAuthenticationCandidate = makeAuthenticationCandidate
+        self.activateProviderModel = activateProviderModel
         self.makeUUID = makeUUID
     }
 
     public static func live(
         store: PersistenceStore,
         adapter: VibeAdapter = VibeAdapter(),
-        neutralApplicationSupportURL: URL
+        neutralApplicationSupportURL: URL,
+        providerRuntimeEnvironment: @escaping @Sendable () async throws -> ProviderRuntimeEnvironment? = { nil },
+        activateProviderModel: @escaping @Sendable (UUID, UUID) async throws -> Void = { _, _ in }
     ) -> SessionModelDependencies {
         .init(
             persistence: .live(store),
@@ -297,25 +322,36 @@ public struct SessionModelDependencies: Sendable {
             },
             validateExecutable: { try adapter.validateExecutable($0) },
             makeRuntime: { executable, cwd in
-                LiveSessionRuntime(
+                let providerEnvironment = try await providerRuntimeEnvironment()
+                return LiveSessionRuntime(
                     executable: executable,
                     workingDirectory: cwd,
-                    adapter: adapter
+                    adapter: adapter,
+                    providerEnvironment: providerEnvironment
                 )
             },
             makeAuthenticationOwner: { executable in
-                AuthCoordinator(
+                let providerEnvironment = try await providerRuntimeEnvironment()
+                return AuthCoordinator(
                     adapter: adapter,
                     executable: executable,
-                    neutralWorkingDirectory: neutralApplicationSupportURL
+                    neutralWorkingDirectory: neutralApplicationSupportURL,
+                    processOptions: .init(environment: ACPProcessEnvironment.sanitized(
+                        injecting: providerEnvironment
+                    ))
                 )
             },
             makeAuthenticationCandidate: { executable in
-                LiveSessionAuthenticationCandidate(candidate: adapter.makeAuthenticationCandidate(
+                let providerEnvironment = try await providerRuntimeEnvironment()
+                return LiveSessionAuthenticationCandidate(candidate: adapter.makeAuthenticationCandidate(
                     executable: executable,
-                    neutralWorkingDirectory: neutralApplicationSupportURL
+                    neutralWorkingDirectory: neutralApplicationSupportURL,
+                    processOptions: .init(environment: ACPProcessEnvironment.sanitized(
+                        injecting: providerEnvironment
+                    ))
                 ))
-            }
+            },
+            activateProviderModel: activateProviderModel
         )
     }
 }

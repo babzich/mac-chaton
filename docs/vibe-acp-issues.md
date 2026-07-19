@@ -1,12 +1,12 @@
 # Vibe ACP Issues
 
 **Status:** Living issue register
-**Date:** 2026-07-18
+**Date:** 2026-07-19
 **Reference Vibe version:** 2.21.0
 
-This document isolates known `vibe-acp` integration constraints and open risks that affect VibeApp's architecture. It is not a list of general ACP limitations, and an item marked **Needs validation** must not be presented as a confirmed upstream defect.
+This document isolates known `vibe-acp` integration constraints and open risks that affect LeChaton's architecture. It is not a list of general ACP limitations, and an item marked **Needs validation** must not be presented as a confirmed upstream defect.
 
-See the [Technical Specification](./technical-spec.md) for VibeApp's architecture and the [Product Specification](./product-spec.md) for user-facing behavior.
+See the [Technical Specification](./technical-spec.md) for the long-term architecture and the [Product Specification](./product-spec.md) for user-facing behavior.
 
 ## Status definitions
 
@@ -14,7 +14,7 @@ See the [Technical Specification](./technical-spec.md) for VibeApp's architectur
 |---|---|
 | Confirmed | Observed in the reference implementation or established by an integration test |
 | Needs validation | Plausible risk that must be tested against the supported Vibe version |
-| Upstream dependent | VibeApp has a mitigation, but a complete solution requires a Vibe change |
+| Upstream dependent | LeChaton has a mitigation, but a complete solution requires a Vibe change |
 
 ## Confirmed constraints
 
@@ -31,10 +31,10 @@ Multiple sessions attached to different directories inside one `vibe-acp` proces
 
 **MVP mitigation**
 
-- Run one `vibe-acp` process per active thread.
+- Run one `vibe-acp` process per active Thread.
 - Give the process an explicit working directory.
-- Never multiplex active VibeApp threads through one process, even though ACP allows multiple sessions on a connection.
-- Use separate Git worktrees when threads work concurrently on the same repository.
+- Never multiplex active LeChaton Threads through one process, even though ACP allows multiple sessions on a connection.
+- Use separate Git worktrees when Threads work concurrently on the same repository.
 
 **Removal condition**
 
@@ -45,22 +45,22 @@ Vibe tools become session-directory-aware without depending on process-global st
 **Status:** Confirmed, upstream dependent
 **Severity:** High
 
-ACP exposes configuration in a session context, but Vibe 2.21.0 persists the active model and thinking configuration in shared Vibe configuration. Changing them for one thread can therefore affect other new or resumed runtimes.
+ACP exposes configuration in a session context, but Vibe 2.21.0 persists the active model and thinking configuration in shared Vibe configuration. Changing them for one Thread can therefore affect other new or resumed runtimes.
 
 **Impact**
 
-VibeApp cannot honestly offer independent model and thinking choices per thread while processes share the same Vibe home.
+LeChaton cannot honestly offer independent model and thinking choices per Thread while processes share the same Vibe home.
 
 **MVP mitigation**
 
 - Present model and thinking settings as app-wide.
 - Serialize configuration writes.
 - Stop or invalidate warm runtimes after a change, then restore them with the new configuration.
-- Keep agent mode and turn limits thread-specific where Vibe actually stores them in session state.
+- Keep agent mode and turn limits Thread-specific where Vibe actually stores them in session state.
 
 **Removal condition**
 
-Vibe supports session-local model and thinking values, or VibeApp deliberately introduces isolated Vibe-home profiles and validates their authentication and session-storage behavior.
+Vibe supports session-local model and thinking values, or LeChaton deliberately introduces isolated Vibe-home profiles and validates their authentication and session-storage behavior.
 
 ### VACP-003: Delegated browser authentication is process-bound
 
@@ -121,18 +121,42 @@ A request/response-only implementation can lose history, render events out of or
 **Status:** Confirmed architectural constraint
 **Severity:** Medium
 
-For the MVP, Vibe uses its built-in Bash, file, edit, and search tools. VibeApp observes tool activity and answers permission requests, but does not provide ACP filesystem or terminal capabilities.
+For the MVP, Vibe uses its built-in Bash, file, edit, and search tools. LeChaton observes tool activity and answers permission requests, but does not provide ACP filesystem or terminal capabilities.
 
 **Impact**
 
-VibeApp does not directly mediate every byte read, written, or emitted by a shell through client-hosted capability APIs. Isolation depends on the process directory, worktree, sandboxing available to Vibe, and permission flow.
+LeChaton does not directly mediate every byte read, written, or emitted by a shell through client-hosted capability APIs. Isolation depends on the process directory, worktree, sandboxing available to Vibe, and permission flow.
 
 **MVP mitigation**
 
 - Launch every runtime with an explicit directory and minimal environment.
-- Render every tool call and route every permission request to the correct thread.
+- Render every tool call and route every permission request to the correct Thread.
 - Keep credentials out of Git and unrelated subprocess environments.
-- Add client-hosted filesystem or terminal capabilities only if VibeApp later needs to become the execution host.
+- Add client-hosted filesystem or terminal capabilities only if LeChaton later needs to become the execution host.
+
+### VACP-007: Empty `session/new` identifiers are not durable
+
+**Status:** Confirmed, upstream dependent
+**Severity:** High
+
+Vibe 2.21.0 can return a session identifier from `session/new` without creating durable session storage. If the process exits before a prompt causes persistence, the identifier is absent from `session/list` and a later `session/load` cannot restore it.
+
+**Impact**
+
+Persisting the identifier immediately can leave LeChaton with selected Thread metadata that points to no Vibe session. This is especially visible when the user creates a Thread but sends no prompt before the runtime exits.
+
+**MVP mitigation**
+
+- Treat every `session/new` result as an in-memory provisional candidate.
+- Use only visible user prompts to produce persistence; never send hidden prompt content or edit a repository file for this purpose.
+- Require a subsequent `session/list` response to contain the exact identifier before committing new or replacement Thread metadata.
+- If a prompt is not persistence-producing or the local commit fails, keep the runtime visibly provisional and offer another prompt, Retry Save, or Discard Draft; never reinterpret the candidate as saved.
+- Keep old replacement metadata selected and resumable until the confirmed candidate transaction commits.
+- If a stored identifier is unavailable during `session/load`, preserve it and offer Retry and Remove Saved Thread without creating a substitute session.
+
+**Removal condition**
+
+Vibe durably creates empty sessions before returning from `session/new`, or ACP exposes another validated durability acknowledgement, followed by a fresh-process load regression test.
 
 ## Risks requiring validation
 
@@ -150,11 +174,11 @@ Verify whether `session/cancel` promptly interrupts long-running shell tools, wh
 **Status:** Needs validation
 **Severity if confirmed:** High
 
-VibeApp intentionally runs several `vibe-acp` processes. Confirm that concurrent session writes, history loading, authentication reads, and shared configuration reads do not corrupt or lose data.
+LeChaton intentionally runs several `vibe-acp` processes. Confirm that concurrent session writes, history loading, authentication reads, and shared configuration reads do not corrupt or lose data.
 
-**Required test:** Run prompts in at least four processes, repeatedly load their sessions, then verify complete and isolated histories. Exercise a configuration change separately because VibeApp serializes that operation.
+**Required test:** Run prompts in at least four processes, repeatedly load their sessions, then verify complete and isolated histories. Exercise a configuration change separately because LeChaton serializes that operation.
 
-### VACP-103: Sign-out while thread runtimes are alive
+### VACP-103: Sign-out while Thread runtimes are alive
 
 **Status:** Needs validation
 **Severity if confirmed:** High
@@ -163,7 +187,7 @@ Confirm whether warm processes retain usable in-memory credentials after global 
 
 **Required test:** Authenticate, start multiple runtimes, sign out through the auth process, then attempt another prompt in each runtime and inspect errors and credential state.
 
-**Required VibeApp behavior regardless of result:** Terminate all warm thread runtimes after sign-out and require authentication before restarting them.
+**Required LeChaton behavior regardless of result:** Terminate all warm Thread runtimes after sign-out and require authentication before restarting them.
 
 ### VACP-104: Session loading after a worktree moves or disappears
 
@@ -179,7 +203,7 @@ Confirm the error behavior when a persisted session is loaded with a missing, re
 **Status:** Needs validation, ongoing
 **Severity if confirmed:** High
 
-VibeApp depends on core ACP behavior plus Vibe-specific authentication and configuration details. Capability negotiation alone may not expose every behavioral change.
+LeChaton depends on core ACP behavior plus Vibe-specific authentication and configuration details. Capability negotiation alone may not expose every behavioral change.
 
 **Required test:** Maintain an opt-in compatibility suite covering initialization, authentication, new/load session, replay, prompts, tools, permissions, cancellation, configuration, and multiple simultaneous processes.
 
@@ -197,12 +221,13 @@ Before supporting a new Vibe version:
 
 | ID | Topic | Status | MVP disposition |
 |---|---|---|---|
-| VACP-001 | Process-global working directory | Confirmed | One process per active thread |
+| VACP-001 | Process-global working directory | Confirmed | One process per active Thread |
 | VACP-002 | Shared model/thinking configuration | Confirmed | App-wide settings |
 | VACP-003 | Process-bound delegated auth | Confirmed | Dedicated persistent auth process |
 | VACP-004 | Vibe-specific auth extensions | Confirmed | Isolate in Vibe adapter |
 | VACP-005 | Replay before load response | Confirmed | Register reducer before load |
 | VACP-006 | Vibe-hosted filesystem and shell tools | Confirmed | Explicit cwd, permissions, isolation |
+| VACP-007 | Empty session nondurability | Confirmed | Confirm exact ID after a visible prompt |
 | VACP-101 | Tool cancellation semantics | Needs validation | Live integration test |
 | VACP-102 | Concurrent shared-storage access | Needs validation | Stress test four processes |
 | VACP-103 | Sign-out and warm runtimes | Needs validation | Terminate runtimes on sign-out |

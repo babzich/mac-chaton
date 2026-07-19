@@ -12,6 +12,7 @@ final class ApplicationContainer {
     private(set) var notice: String?
 
     @ObservationIgnored private var store: PersistenceStore?
+    @ObservationIgnored private var providerStore: ManagedVibeProviderStore?
     @ObservationIgnored private var startTask: Task<Void, Never>?
 
     let locations: PersistenceLocations?
@@ -132,26 +133,61 @@ final class ApplicationContainer {
     private func openStore() async {
         do {
             let store = try PersistenceStore()
+            let adapter = VibeAdapter()
+            let providerStore = ManagedVibeProviderStore(
+                configuration: .live(configURL: Self.userVibeConfigURL()),
+                secrets: SystemProviderSecretStore(),
+                probe: .live(adapter: adapter)
+            )
             let model = SessionModel(
                 store: store,
-                neutralApplicationSupportURL: store.locations.applicationSupportRoot
+                adapter: adapter,
+                neutralApplicationSupportURL: store.locations.applicationSupportRoot,
+                providerRuntimeEnvironment: {
+                    try await providerStore.runtimeEnvironment()
+                },
+                activateProviderModel: { providerID, modelID in
+                    try await providerStore.activate(providerID: providerID, modelID: modelID)
+                }
+            )
+            let providers = ProviderSettingsController(
+                store: providerStore,
+                model: model,
+                locateExecutable: { try adapter.locate(storedPath: $0) }
             )
             let workspace = WorkspaceController(
                 model: model,
                 gitInspector: GitInspector(),
+                providers: providers,
                 persistenceLocations: store.locations
             )
             self.store = store
+            self.providerStore = providerStore
             self.workspace = workspace
             await model.restoreLaunchMetadata()
+            await providers.reload()
             startupState = .ready
         } catch is CancellationError {
             return
         } catch {
             store = nil
+            providerStore = nil
             workspace = nil
             startupState = .failed(DatabaseStartupFailure(error: error))
         }
         startTask = nil
+    }
+
+    private static func userVibeConfigURL() -> URL {
+        let home: URL
+        if let configured = ProcessInfo.processInfo.environment["VIBE_HOME"],
+           !configured.isEmpty
+        {
+            home = URL(filePath: configured, directoryHint: .isDirectory).standardizedFileURL
+        } else {
+            home = FileManager.default.homeDirectoryForCurrentUser
+                .appending(path: ".vibe", directoryHint: .isDirectory)
+        }
+        return home.appending(path: "config.toml", directoryHint: .notDirectory)
     }
 }

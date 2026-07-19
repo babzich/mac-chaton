@@ -10,6 +10,14 @@ public enum SessionItemID: Equatable, Hashable, Sendable {
     case synthetic(runtimeGeneration: UUID, sequence: UInt64)
 }
 
+public enum SessionTranscriptItemReference: Equatable, Hashable, Sendable, Identifiable {
+    case message(role: SessionRole, id: SessionItemID)
+    case reasoning(id: SessionItemID)
+    case tool(id: String)
+
+    public var id: Self { self }
+}
+
 public struct SessionMessage: Equatable, Hashable, Sendable, Identifiable {
     public let id: SessionItemID
     public let role: SessionRole
@@ -52,6 +60,7 @@ public struct SessionState: Equatable, Sendable {
     public var reasoning: [SessionReasoning] = []
     public var toolCalls: [String: SessionToolCall] = [:]
     public var toolCallOrder: [String] = []
+    public var transcriptOrder: [SessionTranscriptItemReference] = []
     public var planID: String?
     public var plan: [PlanEntry] = []
     public var turnState: SessionTurnState = .idle
@@ -177,6 +186,7 @@ public struct SessionReducer: Sendable {
             if let metadata { state.messages[index].metadata = metadata }
         } else {
             state.messages.append(.init(id: id, role: role, blocks: [content], metadata: metadata))
+            state.transcriptOrder.append(.message(role: role, id: id))
         }
     }
 
@@ -195,12 +205,14 @@ public struct SessionReducer: Sendable {
             if let metadata { state.reasoning[index].metadata = metadata }
         } else {
             state.reasoning.append(.init(id: id, blocks: [content], metadata: metadata))
+            state.transcriptOrder.append(.reasoning(id: id))
         }
     }
 
     private mutating func mergeTool(_ patch: ToolCallPatch, replace: Bool) {
         if state.toolCalls[patch.toolCallID] == nil {
             state.toolCallOrder.append(patch.toolCallID)
+            state.transcriptOrder.append(.tool(id: patch.toolCallID))
             state.toolCalls[patch.toolCallID] = SessionToolCall(
                 id: patch.toolCallID,
                 title: patch.title ?? patch.toolCallID,

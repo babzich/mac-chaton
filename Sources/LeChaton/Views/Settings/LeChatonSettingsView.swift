@@ -28,7 +28,7 @@ struct SettingsRootView: View {
                 }
             }
         }
-        .frame(width: 560, height: 470)
+        .frame(width: 760, height: 540)
     }
 }
 
@@ -43,6 +43,9 @@ struct LeChatonSettingsView: View {
 
             configurationSettings
                 .tabItem { Label("Model", systemImage: "slider.horizontal.3") }
+
+            ProviderSettingsView(workspace: workspace)
+                .tabItem { Label("Providers", systemImage: "server.rack") }
         }
         .scenePadding()
         .tint(LeChatonTheme.orange)
@@ -66,6 +69,15 @@ struct LeChatonSettingsView: View {
             }
 
             Section("Mistral Vibe executable") {
+                if workspace.model.hasProvisionalThread {
+                    Label(
+                        "Save or discard the draft Thread before changing executables.",
+                        systemImage: "lock"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
                 LabeledContent("Current path") {
                     Text(workspace.model.selectedVibePath ?? "Automatically located")
                         .lineLimit(1)
@@ -126,7 +138,16 @@ struct LeChatonSettingsView: View {
     private var configurationSettings: some View {
         Form {
             Section("Model and thinking") {
-                if workspace.model.lifecycle != .idle {
+                if workspace.model.hasProvisionalThread {
+                    ContentUnavailableView {
+                        Label("Draft Thread is open", systemImage: "doc.badge.clock")
+                    } description: {
+                        Text("Save or discard the draft before changing model or thinking configuration.")
+                    } actions: {
+                        Button("Open Workspace") { openWindow(id: "main") }
+                    }
+                    .frame(minHeight: 180)
+                } else if workspace.model.lifecycle != .idle {
                     ContentUnavailableView {
                         Label("Load an idle Thread", systemImage: "pause.circle")
                     } description: {
@@ -187,12 +208,7 @@ struct LeChatonSettingsView: View {
     }
 
     private var canValidateExecutable: Bool {
-        switch workspace.model.lifecycle {
-        case .unloaded, .idle, .swapFailed:
-            return true
-        default:
-            return false
-        }
+        workspace.canChangeExecutable
     }
 
     private var currentAuthenticationLabel: String {
@@ -300,6 +316,7 @@ private struct CurrentAuthenticationControls: View {
     private var isBusy: Bool {
         workspace.model.lifecycle == .validatingExecutable
             || workspace.model.lifecycle == .swappingExecutable
+            || workspace.model.lifecycle == .switchingProvider
     }
 }
 
@@ -329,14 +346,14 @@ private struct ExecutableCandidateView: View {
                                 await workspace.completeCandidateAuthentication(attemptID: attempt.id)
                             }
                         }
-                        .disabled(isBusy)
+                        .disabled(isBusy || isDraftBlocked)
                     }
                 }
             } else if candidate.authentication.isAuthenticated != true {
                 Button("Sign In…") {
                     Task { await workspace.startCandidateAuthentication() }
                 }
-                .disabled(isBusy)
+                .disabled(isBusy || isDraftBlocked)
             }
 
             HStack {
@@ -349,7 +366,11 @@ private struct ExecutableCandidateView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(LeChatonTheme.orange)
                 .foregroundStyle(LeChatonTheme.onAccent)
-                .disabled(candidate.authentication.isAuthenticated != true || isBusy)
+                .disabled(
+                    candidate.authentication.isAuthenticated != true
+                        || isBusy
+                        || isDraftBlocked
+                )
             }
 
             if isBusy {
@@ -367,6 +388,11 @@ private struct ExecutableCandidateView: View {
     private var isBusy: Bool {
         workspace.model.lifecycle == .validatingExecutable
             || workspace.model.lifecycle == .swappingExecutable
+            || workspace.model.lifecycle == .switchingProvider
+    }
+
+    private var isDraftBlocked: Bool {
+        workspace.model.hasProvisionalThread
     }
 }
 

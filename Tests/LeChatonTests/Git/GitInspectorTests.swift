@@ -27,6 +27,35 @@ struct GitInspectorTests {
         }
     }
 
+    @Test("Current inspection keeps baseline attribution explicitly unknown")
+    func inspectionWithoutBaselineDoesNotInventAttribution() async throws {
+        try await withRepository { repository in
+            let inspector = GitInspector()
+            try write("current only\n", to: repository.appending(path: "current.txt"))
+
+            let inspection = try await inspector.inspect(repository: repository, baseline: nil)
+            let file = try #require(inspection.files.first(where: { $0.status.path == "current.txt" }))
+
+            #expect(inspection.baseline == nil)
+            #expect(file.baselineAttribution == .unknown)
+            #expect(!file.wasDirtyAtBaseline)
+        }
+    }
+
+    @Test("Known baselines distinguish new paths from pre-existing paths")
+    func knownBaselineMarksNewPathAsNotPreExisting() async throws {
+        try await withRepository { repository in
+            let inspector = GitInspector()
+            let baseline = try await inspector.captureBaseline(repository: repository)
+            try write("created later\n", to: repository.appending(path: "later.txt"))
+
+            let inspection = try await inspector.inspect(repository: repository, baseline: baseline)
+            let file = try #require(inspection.files.first(where: { $0.status.path == "later.txt" }))
+
+            #expect(file.baselineAttribution == .notPreExisting)
+        }
+    }
+
     @Test("Unicode renames, deletions, and untracked text use bounded renderings")
     func renamesDeletionsAndUntrackedText() async throws {
         try await withRepository { repository in

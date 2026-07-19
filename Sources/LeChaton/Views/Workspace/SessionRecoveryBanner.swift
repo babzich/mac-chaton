@@ -6,6 +6,7 @@ struct SessionRecoveryBanner: View {
     let workspace: WorkspaceController
     let issue: SessionModelIssue
     let onRemoveThread: () -> Void
+    let onDiscardDraft: () -> Void
     let onResetRuntime: () -> Void
 
     var body: some View {
@@ -58,6 +59,7 @@ struct SessionRecoveryBanner: View {
         case .authenticationRequired: "person.crop.circle.badge.exclamationmark"
         case .trustRequired: "exclamationmark.shield"
         case .repositoryUnavailable: "folder.badge.questionmark"
+        case .savedSessionUnavailable: "tray.badge.exclamationmark"
         case .cleanupRequired, .swapFailed: "exclamationmark.triangle"
         case .configurationReloadRequired: "arrow.clockwise.circle"
         case .database, .persistence: "externaldrive.badge.exclamationmark"
@@ -70,22 +72,29 @@ struct SessionRecoveryBanner: View {
     private var visibleActions: [SessionRecoveryAction] {
         issue.actions.filter { action in
             guard action != .resetLocalMetadata else { return false }
-            if action == .retry,
-               workspace.model.selectedThread == nil,
-               issue.kind != .database
-            {
-                return false
+            switch action {
+            case .retry:
+                return issue.kind == .database || workspace.model.canResume
+            case .retryThreadSave:
+                return workspace.model.hasProvisionalThread
+                    && workspace.model.lifecycle == .idle
+            case .discardDraftThread:
+                return workspace.canDiscardDraftThread
+            case .resetRuntime:
+                return workspace.canResetRuntime
+            case .removeSavedThread:
+                return workspace.canRemoveThread
+            default:
+                return true
             }
-            if action == .removeSavedThread, workspace.model.selectedThread == nil {
-                return false
-            }
-            return true
         }
     }
 
     private func label(for action: SessionRecoveryAction) -> String {
         switch action {
         case .retry: "Retry"
+        case .retryThreadSave: "Retry Save"
+        case .discardDraftThread: "Discard Draft"
         case .resetRuntime: "Reset Runtime"
         case .removeSavedThread: "Remove Saved Thread"
         case .retryCleanup: "Retry Cleanup"
@@ -100,7 +109,7 @@ struct SessionRecoveryBanner: View {
 
     private func role(for action: SessionRecoveryAction) -> ButtonRole? {
         switch action {
-        case .removeSavedThread, .resetLocalMetadata: .destructive
+        case .discardDraftThread, .removeSavedThread, .resetLocalMetadata: .destructive
         default: nil
         }
     }
@@ -109,6 +118,10 @@ struct SessionRecoveryBanner: View {
         switch action {
         case .retry:
             Task { await workspace.retryCurrentIssue() }
+        case .retryThreadSave:
+            Task { await workspace.retryThreadSave() }
+        case .discardDraftThread:
+            onDiscardDraft()
         case .resetRuntime:
             onResetRuntime()
         case .retryCleanup:
@@ -169,5 +182,6 @@ private struct CurrentAuthenticationRecoveryControls: View {
     private var isBusy: Bool {
         workspace.model.lifecycle == .validatingExecutable
             || workspace.model.lifecycle == .swappingExecutable
+            || workspace.model.lifecycle == .switchingProvider
     }
 }

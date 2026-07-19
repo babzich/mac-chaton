@@ -1,3 +1,4 @@
+import Foundation
 import LeChatonCore
 import SwiftUI
 
@@ -10,8 +11,16 @@ struct WorkspaceSidebarView: View {
             Section("Workspace") {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(workspace.model.selectedThread?.thread.title ?? "Conversation")
-                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            Text(workspace.model.threadPresentation?.title ?? "Conversation")
+                                .lineLimit(1)
+
+                            if workspace.model.threadPresentation?.isProvisional == true {
+                                Text("Draft")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(LeChatonTheme.orange)
+                            }
+                        }
                         Text(lifecycleLabel)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -22,8 +31,9 @@ struct WorkspaceSidebarView: View {
                         .foregroundStyle(LeChatonTheme.orange)
                 }
                 .tag(WorkspaceDestination.conversation)
+                .help(threadHelp)
 
-                if workspace.model.selectedThread != nil {
+                if workspace.model.threadPresentation != nil {
                     Label("Repository Changes", systemImage: "arrow.triangle.branch")
                         .tag(WorkspaceDestination.changes)
                 }
@@ -46,11 +56,20 @@ struct WorkspaceSidebarView: View {
         case .replacingThread: "Replacing Thread"
         case .validatingExecutable: "Validating Vibe"
         case .swappingExecutable: "Swapping Vibe"
+        case .switchingProvider: "Switching Provider"
         case .reloadRequired: "Reload required"
         case .cleanupRequired: "Cleanup required"
         case .swapFailed: "Swap failed"
         case .failed: "Failed"
         }
+    }
+
+    private var threadHelp: String {
+        guard let thread = workspace.model.threadPresentation else {
+            return "Start a Thread in a Git repository"
+        }
+        let state = thread.isProvisional ? "Unsaved draft" : "Saved Thread"
+        return "\(state)\n\(thread.cwd)\nVibe session \(thread.vibeSessionID)"
     }
 }
 
@@ -65,6 +84,7 @@ private struct RuntimeStatusView: View {
             Label(authenticationLabel, systemImage: authenticationIcon)
                 .foregroundStyle(authenticationColor)
                 .help(authenticationHelp)
+                .accessibilityLabel(authenticationAccessibilityLabel)
             Label(trustLabel, systemImage: trustIcon)
                 .foregroundStyle(trustColor)
                 .help(trustHelp)
@@ -89,7 +109,7 @@ private struct RuntimeStatusView: View {
         case .unknown: "Authentication not checked"
         case let .status(status):
             switch status.state {
-            case .authenticated: "Authenticated"
+            case .authenticated: Self.localUserDisplayName ?? "Authenticated"
             case .unauthenticated: "Sign-in required"
             case .unknown: "Authentication not checked"
             }
@@ -97,7 +117,28 @@ private struct RuntimeStatusView: View {
     }
 
     private var authenticationHelp: String {
-        "LeChaton does not start Vibe at launch. Resume a Thread or use Refresh Status in Settings to check authentication."
+        switch workspace.model.authentication {
+        case let .status(status) where status.state == .authenticated:
+            if let name = Self.localUserDisplayName {
+                return "Vibe is authenticated. \(name) is the local macOS account name; Vibe does not expose the signed-in Mistral profile name."
+            }
+            return "Vibe is authenticated."
+        case let .status(status) where status.state == .unauthenticated:
+            return "Vibe needs authentication. Open Settings to sign in."
+        default:
+            return "LeChaton does not start Vibe at launch. Resume a Thread or use Refresh Status in Settings to check authentication."
+        }
+    }
+
+    private var authenticationAccessibilityLabel: String {
+        switch workspace.model.authentication {
+        case let .status(status) where status.state == .authenticated:
+            "\(authenticationLabel), Vibe authenticated"
+        case let .status(status) where status.state == .unauthenticated:
+            "Vibe authentication required"
+        default:
+            "Vibe authentication not checked"
+        }
     }
 
     private var authenticationIcon: String {
@@ -122,6 +163,7 @@ private struct RuntimeStatusView: View {
         case let .status(status):
             switch status.state {
             case .trusted: "Repository trusted"
+            case .untrusted where status.allowsSessionStart: "No trust decision needed"
             case .untrusted: "Trust required in Vibe"
             case .unknown: "Repository trust not checked"
             }
@@ -129,12 +171,27 @@ private struct RuntimeStatusView: View {
     }
 
     private var trustHelp: String {
-        "Repository trust is checked only when LeChaton starts or resumes a Vibe session."
+        switch workspace.model.trust {
+        case .unknown:
+            "Repository trust controls whether Vibe may load project-owned instructions and configuration. LeChaton checks it when starting or resuming a Thread."
+        case let .status(status):
+            switch status.state {
+            case .trusted:
+                "This repository is trusted. Vibe may load its project-owned instructions and configuration."
+            case .untrusted where status.allowsSessionStart:
+                "Vibe found no project-owned instructions or configuration that need a trust decision, so it can continue with project configuration excluded."
+            case .untrusted:
+                "Trusting permits Vibe to load project-owned instructions and configuration. Vibe owns and stores the decision."
+            case .unknown:
+                "Vibe returned a repository trust state LeChaton does not recognize. Retry the check or resolve it in Vibe."
+            }
+        }
     }
 
     private var trustIcon: String {
         switch workspace.model.trust {
         case let .status(status) where status.state == .trusted: "checkmark.shield"
+        case let .status(status) where status.allowsSessionStart: "shield"
         case let .status(status) where status.state == .untrusted: "exclamationmark.shield"
         default: "questionmark.diamond"
         }
@@ -143,8 +200,14 @@ private struct RuntimeStatusView: View {
     private var trustColor: Color {
         switch workspace.model.trust {
         case let .status(status) where status.state == .trusted: LeChatonTheme.success
+        case let .status(status) where status.allowsSessionStart: LeChatonTheme.secondaryText
         case let .status(status) where status.state == .untrusted: LeChatonTheme.amber
         default: LeChatonTheme.secondaryText
         }
     }
+
+    private static let localUserDisplayName: String? = {
+        let name = NSFullUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }()
 }

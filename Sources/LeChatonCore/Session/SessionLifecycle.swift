@@ -9,6 +9,7 @@ public enum SessionLifecycle: Equatable, Hashable, Sendable {
     case replacingThread
     case validatingExecutable
     case swappingExecutable
+    case switchingProvider
     case reloadRequired
     case cleanupRequired
     case swapFailed

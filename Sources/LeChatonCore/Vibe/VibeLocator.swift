@@ -76,7 +76,7 @@ public struct VibeCompatibility: Equatable, Sendable {
     public static let supportedProtocolVersion = ACPProtocol.supportedVersion
     public static let supportedAgentName = "@mistralai/mistral-vibe"
     public static let supportedVersion = "2.21.0"
-    public static let requiredCapabilities = ["loadSession"]
+    public static let requiredCapabilities = ["loadSession", "sessionCapabilities.list"]
 
     public let executable: VibeExecutable
     public let initialization: ACPInitializeResult
@@ -105,13 +105,17 @@ public struct VibeCompatibility: Equatable, Sendable {
                 executable: executable.url.path
             )
         }
-        for capability in Self.requiredCapabilities {
-            guard initialization.agentCapabilities[capability]?.boolValue == true else {
-                throw VibeCompatibilityError.missingRequiredCapability(
-                    capability,
-                    executable: executable.url.path
-                )
-            }
+        guard initialization.agentCapabilities["loadSession"]?.boolValue == true else {
+            throw VibeCompatibilityError.missingRequiredCapability(
+                "loadSession",
+                executable: executable.url.path
+            )
+        }
+        guard initialization.agentCapabilities["sessionCapabilities"]?["list"]?.objectValue != nil else {
+            throw VibeCompatibilityError.missingRequiredCapability(
+                "sessionCapabilities.list",
+                executable: executable.url.path
+            )
         }
         self.executable = executable
         self.initialization = initialization

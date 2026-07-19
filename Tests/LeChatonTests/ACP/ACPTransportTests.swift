@@ -40,6 +40,47 @@ struct ACPTransportTests {
         #expect(report?.survivors.isEmpty == true)
     }
 
+    @Test("Session listing decodes standard cursor pages and preserves unknown fields")
+    func paginatedSessionList() async throws {
+        let transport = try makeTransport(scenario: "session-list-paginated")
+        _ = try await transport.start()
+        _ = try await withTimeout { try await transport.initialize() }
+
+        let first = try await withTimeout {
+            try await transport.listSessions(cwd: repositoryURL)
+        }
+        #expect(first.sessions.map(\.sessionID) == ["another-session"])
+        #expect(first.sessions[0].cwd == repositoryURL.path)
+        #expect(first.sessions[0].additionalDirectories.isEmpty)
+        #expect(first.sessions[0].title == "Another session")
+        #expect(first.sessions[0].updatedAt == "2030-01-01T00:00:00Z")
+        #expect(first.sessions[0].metadata?["itemFuture"]?.boolValue == true)
+        #expect(first.sessions[0].raw["futureItemField"]?.intValue == 1)
+        #expect(first.nextCursor == "page-2")
+        #expect(first.metadata?["pageFuture"]?.boolValue == true)
+        #expect(first.raw["futurePageField"]?.intValue == 2)
+
+        let second = try await withTimeout {
+            try await transport.listSessions(cwd: repositoryURL, cursor: first.nextCursor)
+        }
+        #expect(second.sessions.map(\.sessionID) == ["persisted-session"])
+        #expect(second.nextCursor == nil)
+
+        _ = await transport.stop(gracePeriod: .milliseconds(50))
+    }
+
+    @Test("Malformed known session-list fields fail without rejecting unknown fields")
+    func malformedSessionList() async throws {
+        let transport = try makeTransport(scenario: "malformed-session-list")
+        _ = try await transport.start()
+        _ = try await withTimeout { try await transport.initialize() }
+
+        await #expect(throws: ACPTransportError.invalidResponse(method: "session/list")) {
+            _ = try await transport.listSessions(cwd: repositoryURL)
+        }
+        _ = await transport.stop(gracePeriod: .milliseconds(50))
+    }
+
     @Test("A history envelope after the load response fails the runtime")
     func replayAfterResponseFails() async throws {
         let transport = try makeTransport(scenario: "replay-after-response")

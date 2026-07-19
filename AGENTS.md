@@ -11,7 +11,7 @@ Read the matching ADR before making architecture-affecting changes. Accepted ADR
 | Architecture principles, boundaries, or adding abstractions | [0001 Architecture Principles](docs/adr/0001-architecture-principles.md) |
 | Targets, delivery surfaces, or dependency direction | [0002 Core And Delivery Surfaces](docs/adr/0002-core-and-delivery-surfaces.md) |
 | State ownership, actors, streaming, permissions, cancellation, or runtime replacement | [0003 State And Concurrency Ownership](docs/adr/0003-state-and-concurrency-ownership.md) |
-| ACP, Vibe, Git, credentials, subprocesses, trust, or compatibility | [0004 External Integration Boundaries](docs/adr/0004-external-integration-boundaries.md) |
+| ACP, Vibe, providers, API keys, Vibe configuration, Git, subprocesses, trust, or compatibility | [0004 External Integration Boundaries](docs/adr/0004-external-integration-boundaries.md) |
 | Tuist, build/run workflow, tests, validation gates, or compatibility evidence | [0005 Project Generation And Validation](docs/adr/0005-project-generation-and-validation.md) |
 | Persistence ownership, migrations, durable metadata, session restoration, or database recovery | [0006 Persistence And Session Restoration](docs/adr/0006-persistence-and-session-restoration.md) |
 | Creating or changing a durable architecture rule | Use `$write-lechaton-adr` from `.agents/skills/write-lechaton-adr/` |

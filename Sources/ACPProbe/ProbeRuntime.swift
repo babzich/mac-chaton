@@ -94,12 +94,7 @@ struct ProbeRuntime: Sendable {
                 params: .object(["cwd": .string(cwd.path)])
             )
         }
-        let trusted = trust["trusted"]?.boolValue
-            ?? trust["isTrusted"]?.boolValue
-            ?? trust["status"]?.stringValue.map { $0 == "trusted" }
-            ?? trust["trust_status"]?.stringValue.map { $0 == "trusted" }
-        let actionableDetails = trust["details"]?.objectValue
-        guard trusted == true || actionableDetails == nil else {
+        guard VibeRepositoryTrustStatus(raw: trust).allowsSessionStart else {
             throw ProbeError.compatibility(
                 "repository has an unresolved trust decision; resolve one of Vibe's advertised choices outside the live gate"
             )

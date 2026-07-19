@@ -15,6 +15,8 @@ struct FakeACPAgentMain {
         var authenticated = true
         var authenticationStatusRequestCount = 0
         var pendingAuthenticationAttemptID: String?
+        var persistedSessionIDs: Set<String> = []
+        var sessionListRequestCount = 0
         var workspaceTrusted = false
         var stopReadingStandardInput = false
     }
@@ -31,6 +33,9 @@ struct FakeACPAgentMain {
         }
         if state.scenario == "auth-unauthenticated" {
             state.authenticated = false
+        } else if state.scenario == "auth-provider-environment" {
+            state.authenticated = ProcessInfo.processInfo.environment["LECHATON_TEST_PROVIDER_KEY"]
+                == "provider-secret"
         }
 
         while let line = readLine(strippingNewline: true) {
@@ -70,6 +75,9 @@ struct FakeACPAgentMain {
                     "protocolVersion": .integer(state.scenario == "protocol-two" ? 2 : 1),
                     "agentCapabilities": .object([
                         "loadSession": .bool(state.scenario != "missing-load-capability"),
+                        "sessionCapabilities": state.scenario == "missing-list-capability"
+                            ? .object([:])
+                            : .object(["list": .object([:])]),
                         "promptCapabilities": .object([
                             "audio": .bool(false),
                             "embeddedContext": .bool(true),
@@ -224,9 +232,102 @@ struct FakeACPAgentMain {
             case "session/new":
                 write(JSONRPCMessage.response(id: request.id, result: sessionResult(state: state)))
 
+            case "session/list":
+                let processCWD = FileManager.default.currentDirectoryPath
+                state.sessionListRequestCount += 1
+                if state.scenario == "malformed-session-list" {
+                    write(JSONRPCMessage.response(id: request.id, result: .object([
+                        "sessions": .string("not-an-array"),
+                    ])))
+                    return
+                }
+
+                if state.scenario == "session-list-paginated" {
+                    let cursor = request.params?["cursor"]?.stringValue
+                    if cursor == nil {
+                        write(JSONRPCMessage.response(id: request.id, result: .object([
+                            "sessions": .array([.object([
+                                "sessionId": .string("another-session"),
+                                "cwd": .string(processCWD),
+                                "additionalDirectories": .array([]),
+                                "title": .string("Another session"),
+                                "updatedAt": .string("2030-01-01T00:00:00Z"),
+                                "_meta": .object(["itemFuture": .bool(true)]),
+                                "futureItemField": .integer(1),
+                            ])]),
+                            "nextCursor": .string("page-2"),
+                            "_meta": .object(["pageFuture": .bool(true)]),
+                            "futurePageField": .integer(2),
+                        ])))
+                    } else if cursor == "page-2" {
+                        write(JSONRPCMessage.response(id: request.id, result: .object([
+                            "sessions": .array([.object([
+                                "sessionId": .string("persisted-session"),
+                                "cwd": .string(processCWD),
+                                "futureItemField": .integer(3),
+                            ])]),
+                        ])))
+                    } else {
+                        write(JSONRPCMessage.response(id: request.id, result: .object([
+                            "sessions": .array([]),
+                        ])))
+                    }
+                    return
+                }
+
+                if state.scenario == "session-list-cursor-loop" {
+                    write(JSONRPCMessage.response(id: request.id, result: .object([
+                        "sessions": .array([]),
+                        "nextCursor": .string("same-cursor"),
+                    ])))
+                    return
+                }
+
+                if state.scenario == "session-list-unique-cursors" {
+                    write(JSONRPCMessage.response(id: request.id, result: .object([
+                        "sessions": .array([]),
+                        "nextCursor": .string("page-\(state.sessionListRequestCount)"),
+                    ])))
+                    return
+                }
+
+                let requestedCWD = request.params?["cwd"]?.stringValue
+                let sessions: [JSONValue] = requestedCWD == nil || requestedCWD == processCWD
+                    ? state.persistedSessionIDs.sorted().map { sessionID in
+                        .object([
+                            "sessionId": .string(sessionID),
+                            "cwd": .string(processCWD),
+                        ])
+                    }
+                    : []
+                write(JSONRPCMessage.response(id: request.id, result: .object([
+                    "sessions": .array(sessions),
+                ])))
+
             case "session/load":
                 if state.scenario == "no-load-response" { return }
-                if let requestedID = request.params?["sessionId"]?.stringValue { state.sessionID = requestedID }
+                if let requestedID = request.params?["sessionId"]?.stringValue {
+                    if state.scenario.hasPrefix("session-not-found") {
+                        var data: JSONValue = .object(["session_id": .string(requestedID)])
+                        var message = "Session not found: \(requestedID)"
+                        if state.scenario == "session-not-found-wrong-data" {
+                            data = .object(["session_id": .string("another-session")])
+                        } else if state.scenario == "session-not-found-extra-data" {
+                            data = .object([
+                                "session_id": .string(requestedID),
+                                "future": .bool(true),
+                            ])
+                        } else if state.scenario == "session-not-found-wrong-message" {
+                            message = "Session missing: \(requestedID)"
+                        }
+                        write(JSONRPCMessage.errorResponse(
+                            id: request.id,
+                            error: .init(code: -32602, message: message, data: data)
+                        ))
+                        return
+                    }
+                    state.sessionID = requestedID
+                }
                 if state.scenario == "malformed-load-response" {
                     write(JSONRPCMessage.response(id: request.id, result: .object([
                         "configOptions": .string("not-an-array"),
@@ -254,6 +355,9 @@ struct FakeACPAgentMain {
                 }
 
             case "session/prompt":
+                if let sessionID = request.params?["sessionId"]?.stringValue {
+                    state.persistedSessionIDs.insert(sessionID)
+                }
                 state.pendingPromptID = request.id
                 if state.scenario == "descendant-graceful" {
                     state.descendantProcess = spawnDescendant(mode: "graceful")

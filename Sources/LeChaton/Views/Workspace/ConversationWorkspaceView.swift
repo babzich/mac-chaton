@@ -5,19 +5,25 @@ struct ConversationWorkspaceView: View {
     let workspace: WorkspaceController
     let onNewThread: () -> Void
     let onRemoveThread: () -> Void
+    let onDiscardDraft: () -> Void
     let onResetRuntime: () -> Void
 
     var body: some View {
         Group {
-            if let metadata = workspace.model.selectedThread {
+            if let thread = workspace.model.threadPresentation {
                 VStack(spacing: 0) {
-                    SessionHeaderView(metadata: metadata)
+                    SessionHeaderView(
+                        thread: thread,
+                        canDiscardDraft: workspace.canDiscardDraftThread,
+                        onDiscardDraft: onDiscardDraft
+                    )
 
                     if let issue = workspace.model.issue {
                         SessionRecoveryBanner(
                             workspace: workspace,
                             issue: issue,
                             onRemoveThread: onRemoveThread,
+                            onDiscardDraft: onDiscardDraft,
                             onResetRuntime: onResetRuntime
                         )
                         .padding(.horizontal)
@@ -39,6 +45,7 @@ struct ConversationWorkspaceView: View {
                                 workspace: workspace,
                                 issue: issue,
                                 onRemoveThread: onRemoveThread,
+                                onDiscardDraft: onDiscardDraft,
                                 onResetRuntime: onResetRuntime
                             )
                             .padding()
@@ -118,11 +125,7 @@ struct ConversationWorkspaceView: View {
         default:
             VStack(spacing: 0) {
                 historySurface
-                if workspace.model.lifecycle == .idle, !workspace.isGitBaselineReady {
-                    GitBaselineRequiredBar(workspace: workspace)
-                } else {
-                    PromptComposerView(workspace: workspace)
-                }
+                PromptComposerView(workspace: workspace)
             }
         }
     }
@@ -151,41 +154,6 @@ struct ConversationWorkspaceView: View {
     }
 }
 
-private struct GitBaselineRequiredBar: View {
-    let workspace: WorkspaceController
-
-    var body: some View {
-        HStack(spacing: 10) {
-            if workspace.git.isLoading {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Image(systemName: "arrow.triangle.branch")
-                    .foregroundStyle(LeChatonTheme.amber)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(workspace.git.isLoading ? "Capturing repository baseline…" : "Repository baseline required")
-                    .font(.callout.weight(.semibold))
-                Text("Prompts stay disabled until the pre-existing Git state is captured.")
-                    .font(.caption)
-                    .foregroundStyle(LeChatonTheme.secondaryText)
-            }
-            Spacer()
-            if !workspace.git.isLoading {
-                Button("Retry Baseline") {
-                    Task { await workspace.refreshGit() }
-                }
-            }
-        }
-        .padding(12)
-        .background(.regularMaterial)
-        .overlay(alignment: .top) {
-            Rectangle().fill(LeChatonTheme.hairline).frame(height: 1)
-        }
-        .accessibilityElement(children: .contain)
-    }
-}
-
 private struct ExecutableCandidateRecoveryBar: View {
     var body: some View {
         HStack {
@@ -208,27 +176,52 @@ private struct ExecutableCandidateRecoveryBar: View {
 }
 
 private struct SessionHeaderView: View {
-    let metadata: SavedThreadMetadata
+    let thread: ThreadPresentation
+    let canDiscardDraft: Bool
+    let onDiscardDraft: () -> Void
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(metadata.thread.title)
-                    .font(.headline)
-                    .lineLimit(1)
-                Text(metadata.environment.cwd)
+                HStack(spacing: 8) {
+                    Text(thread.title)
+                        .font(.headline)
+                        .lineLimit(1)
+
+                    if thread.isProvisional {
+                        Text("DRAFT")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(LeChatonTheme.orange)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(LeChatonTheme.orange.opacity(0.12), in: .capsule)
+                            .accessibilityLabel("Unsaved draft Thread")
+                    }
+                }
+                Text(thread.cwd)
                     .font(.caption.monospaced())
                     .foregroundStyle(LeChatonTheme.secondaryText)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
             Spacer()
-            Text(metadata.thread.vibeSessionID)
+            Text(thread.vibeSessionID)
                 .font(.caption.monospaced())
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
                 .textSelection(.enabled)
                 .help("Vibe session ID")
+
+            if thread.isProvisional {
+                Button(action: onDiscardDraft) {
+                    Label("Discard Draft", systemImage: "trash")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .foregroundStyle(LeChatonTheme.danger)
+                .disabled(!canDiscardDraft)
+                .help("Stop the provisional Vibe session and discard this unsaved draft")
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
@@ -239,7 +232,7 @@ private struct SessionHeaderView: View {
                 .frame(height: 1)
                 .opacity(0.55)
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 

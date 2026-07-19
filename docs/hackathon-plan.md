@@ -2,7 +2,7 @@
 
 ## Summary and Decision Gates
 
-Build a native macOS prototype around one user-accessible saved Thread backed by one Mistral Vibe 2.21.0 ACP session. The prototype covers restart and explicit Resume, replay-safe streaming, Vibe-managed authentication, repository trust, permissions, cancellation with complete process cleanup, app-wide model and thinking Settings, executable replacement, and bounded read-only Git inspection.
+Build a native macOS prototype around one user-accessible saved Thread backed by one Mistral Vibe 2.21.0 ACP session. The prototype covers restart and explicit Resume, replay-safe streaming, Vibe-managed authentication, app-managed OpenAI-compatible provider profiles, repository trust, permissions, cancellation with complete process cleanup, app-wide model and thinking Settings, executable replacement, and bounded read-only Git inspection.
 
 This is a quality-gated prototype estimated at **9-13 focused engineering days**, not the original 140-minute exercise. Use `feature/lechaton-mvp` and Conventional Commits. Create the branch before documentation or implementation changes.
 
@@ -41,7 +41,7 @@ Ownership remains explicit:
 - `AuthCoordinator` is an actor owning the separate, lazily created authentication process.
 - `VibeAdapter` is the sole Vibe-specific wire boundary. `VibeLocator` is a UI-independent core component; the native executable picker remains app-owned.
 
-Require ACP protocol 1, exact `agentInfo.version == "2.21.0"`, and negotiated required capabilities on every Vibe process. Keep JSON-RPC IDs as string-or-number `RPCID`, `_meta` as recursive `JSONValue`, and forward-compatible enums as `.unknown(rawValue)`.
+Require ACP protocol 1, exact `agentInfo.version == "2.21.0"`, flat `loadSession == true`, and nested `sessionCapabilities.list` on every Vibe process. Keep JSON-RPC IDs as string-or-number `RPCID`, `_meta` as recursive `JSONValue`, and forward-compatible enums as `.unknown(rawValue)`.
 
 `VibeLocator` resolves executables in this order: an explicit `ACPProbe --vibe-path`, the app's persisted selected path, `~/.local/bin/vibe-acp`, `/opt/homebrew/bin/vibe-acp`, `/usr/local/bin/vibe-acp`, then the app-owned native picker. Resolve symlinks and require a regular executable file; never depend on a GUI shell `PATH`.
 
@@ -97,7 +97,7 @@ Invalid JSON-RPC, a malformed matching load response, or missing/invalid require
 
 - Reduce initial Resume history into an unpublished staging reducer. Never render partial history.
 - A settings-triggered reload may retain a labeled, disabled `KnownGoodSnapshot`; it is presentation-only and never active runtime state. Replace it atomically when the fresh load succeeds.
-- Any load failure invalidates the runtime generation before shutdown, discards staging, preserves saved metadata, and offers Retry, Reset Runtime, and Remove Saved Thread. Never fall back to `session/new`.
+- Any load failure invalidates the runtime generation before shutdown, discards staging, and preserves saved metadata. General failures offer Retry, Reset Runtime, and Remove Saved Thread; an exact unavailable-session result offers explicit Retry and Remove Saved Thread. Never fall back to `session/new`.
 - Merge replayed messages and tools idempotently when stable IDs exist.
 - Treat every ID-less update as a distinct synthetic `(runtimeGeneration, sequence)` event. Do not claim that arbitrary upstream ID-less chunks can be deduplicated across loads; prevent only duplicates introduced by LeChaton's own routing.
 - Plans are live, transient reducer state. Clear them on unload, never persist them, and expect the plan panel to start empty after Resume. Vibe 2.21.0 replay is expected to restore messages, reasoning, and replayable tool activity, not old plans.
@@ -152,9 +152,13 @@ Keep the relational schema plural and forward-compatible. The prototype's one us
 
 Persist only project identity, Thread metadata, Vibe session ID, local environment, selection, and the selected executable path. Never persist conversation/reducer/tool/plan state, permissions, trust decisions, credentials, authentication payloads, model, or thinking.
 
+A `session/new` identifier remains provisional and in memory. Persist a new or replacement Thread only after a visible user prompt has caused Vibe to persist the session and `session/list` contains the exact identifier. Never send a hidden prompt or edit a repository file to force persistence.
+
+Follow at most 32 `session/list` pages, reject cursor cycles, and leave the candidate provisional with explicit retry/discard recovery when confirmation cannot complete.
+
 ### Repository validity and canonicalization
 
-- Require a non-bare Git worktree with a valid HEAD commit. Local staged, unstaged, and untracked modifications are allowed and captured as the pre-existing baseline.
+- Require a non-bare Git worktree with a valid HEAD commit. Local staged, unstaged, and untracked modifications are allowed. Their pre-existing attribution is best-effort and valid only when baseline capture completes before the first prompt.
 - Canonicalize paths through `realpath`: absolute, symlink-resolved, and without a trailing separator. For v1, environment `cwd` equals the canonical project root.
 - Repository relocation and import remain deferred. A missing saved repository appears unavailable with Retry and Remove Saved Thread actions.
 
@@ -163,9 +167,10 @@ Persist only project identity, Thread metadata, Vibe session ID, local environme
 ### Launch, New Thread, and Resume
 
 - App launch runs migrations and restores metadata without starting Vibe. A saved Thread appears Unloaded and requires explicit Resume.
-- New Thread initializes a session runtime, calls `session/new`, then writes project, environment, Vibe session ID, and selection in one transaction before accepting the first prompt.
-- If persistence fails, terminate the new runtime, keep the previous selection unchanged, and warn that an unreachable Vibe-side session may remain.
+- New Thread initializes a provisional runtime and calls `session/new` without writing Thread metadata. After each successful visible prompt, it checks `session/list`; only the exact identifier permits project, environment, Vibe session ID, and selection to commit in one transaction.
+- If a prompt does not produce a listed session, keep the usable candidate visibly provisional and allow another prompt or explicit save retry. If the database transaction fails after Vibe persistence, keep the candidate runtime usable, retain the previous durable selection, and offer Retry Save or Discard Draft. Quitting still persists no candidate metadata.
 - Resume validates repository, executable, authentication, and trust before starting a fresh runtime and empty staging reducer for `session/load`.
+- If `session/load` reports the exact stored identifier unavailable, preserve all metadata and offer Retry and Remove Saved Thread without creating a substitute session.
 - Reset Runtime disposes transient state while preserving saved metadata.
 - Remove Saved Thread warns that LeChaton will lose the Vibe session ID while Vibe's own session files remain untouched.
 
@@ -174,19 +179,21 @@ Persist only project identity, Thread metadata, Vibe session ID, local environme
 Allow replacement only while Unloaded or Idle and preserve the one-session-runtime invariant:
 
 ```text
-enter non-interactive Replacing
+enter Replacing
 -> invalidate the old runtime generation and load attempts
 -> dispose the old session runtime and verify its process tree is gone
 -> retain the old metadata and selection as Unloaded
 -> launch the sole replacement session runtime
--> initialize and call session/new
+-> initialize and call session/new provisionally
+-> accept visible user prompts until Vibe persists the candidate
+-> require session/list to contain the exact candidate identifier
 -> commit the replacement database transaction
 -> atomically publish replacement runtime and metadata
 ```
 
 - Never launch the replacement process until old cleanup is verified.
 - Cleanup failure launches no replacement and enters Cleanup Required with Resume disabled.
-- Before the database commit, failure terminates the candidate and leaves the old saved Thread selected, unloaded, and resumable.
+- Before the database commit, the old saved Thread remains the durable selection. A non-persisting prompt or metadata-write failure leaves the replacement candidate usable and visibly provisional with Retry Save and Discard Draft; discarding or quitting returns to the old Thread as Unloaded and resumable.
 - The commit makes the replacement authoritative. A later candidate crash leaves the replacement unloaded or failed and resumable; never resurrect deleted old metadata.
 - The separate auth process and a private executable-validation process do not count as session runtimes.
 
@@ -200,6 +207,14 @@ enter non-interactive Replacing
 - Never silently delete the only forensic copy.
 
 ## Settings
+
+### Managed OpenAI-compatible providers
+
+The Providers tab manages only generated `lechaton_` provider and model identifiers in the user `VIBE_HOME/config.toml`. It preserves unrelated semantic TOML values, rejects reserved-name collisions and stale external edits, makes a timestamped recoverable backup, and atomically replaces the file without editing repository-local `.vibe` configuration. TOMLKit 0.6.0 is pinned exactly; comment preservation is not promised because Vibe may rewrite the whole document.
+
+Provider keys live only in non-synchronizing, When-Unlocked Keychain items under `com.vincentbach.LeChaton.vibe-provider`. Vibe configuration stores only a generated environment-variable name. After the standard environment allowlist is built, LeChaton injects the resolved key into the matching session, auth-status, executable-validation, or disposable provider-test process. Mistral browser credentials, unrelated processes, SQLite, TOML, diagnostics, logs, errors, and arguments never receive it.
+
+Users enter model IDs manually. Remote endpoints require HTTPS; keyless mode is limited to loopback HTTP/HTTPS. Draft changes invalidate a prior test. Testing discloses token use and runs initialization, streaming, and one narrowly authorized temporary-file tool check through a disposable Vibe ACP process using an isolated Vibe home and temporary Git repository. Save accepts only the exact tested draft. Activation is separate, is allowed only while Unloaded or Idle, disposes the session and auth owners before the Vibe-config commit, publishes Unloaded, and requires explicit Resume. An active provider cannot be removed until another model is active.
 
 ### Executable candidate and swap
 
@@ -266,12 +281,13 @@ Use `NavigationSplitView` with an inspector:
 
 Keep Git read-only and behind its adapter. Every invocation uses `/usr/bin/git`, an explicit working directory, argument arrays, no shell interpolation, and `--` before paths.
 
-- Capture baseline and current state with `git status --porcelain=v2 -z --untracked-files=all`.
+- Capture baseline and current state with `git status --porcelain=v2 -z --untracked-files=all`. Capture is auxiliary: it never delays session startup, disables the composer, or blocks a prompt.
 - Render staged and unstaged diffs separately with no color, external diff, or textconv.
 - Generate a synthetic `/dev/null` unified diff for bounded text untracked files.
 - Use explicit placeholders for binary content, submodules, non-regular files, oversized input, truncation, and Git errors.
 - Cap each rendered file at 512 KiB or 10,000 lines.
-- Recapture baseline on Resume and label pre-existing dirty paths without claiming hunk attribution.
+- Attempt a fresh baseline on New Thread and Resume. Label pre-existing dirty paths only if capture completed before the first prompt request, without claiming hunk attribution.
+- If the first prompt wins the race or capture fails, keep prompting available and show current-only changes with attribution Unknown. A later capture must not be relabeled as the pre-prompt baseline; retry attribution on the next Resume.
 
 ## Implementation Sequence and Live Gate
 
@@ -294,6 +310,7 @@ Fail immediately if any known reducer-bound history envelope arrives after its m
 
 The same gate must:
 
+- Create one empty `session/new`, terminate it, and verify a fresh process cannot list or load that identifier. Separately send an explicit prompt to a provisional session and require `session/list` to report its exact identifier before using it as compatibility evidence.
 - Exercise model/thinking mutation, fresh-process reload, effective-value verification, and journal-backed restoration on all exit paths.
 - When no alternative value is advertised, run the idempotent current-value test and record cross-value switching as not validated.
 - Start a descendant-producing prompt, cancel it, and verify that no tracked process identity survives.
@@ -307,17 +324,22 @@ Default tests remain deterministic and offline after explicit dependency bootstr
 - Stable-ID idempotency, the explicit non-deduplication contract for ID-less events, and plan clearing on unload/Resume.
 - FIFO permissions, cancellation races, duplicate cancellation, late updates, and one-time continuation failure.
 - Initial and late descendants, grandchildren after root exit, reparenting, PGID changes, PID reuse, `EPERM`, TERM resistance, mixed groups, and zero signals to app/test processes.
-- Thread replacement cleanup-before-create, failure before/after database commit, and the one-session-runtime invariant.
+- Empty `session/new` nondurability, exact `session/list` confirmation after a user prompt, no hidden persistence work, and no metadata commit when confirmation is absent.
+- Thread replacement cleanup-before-create, old-metadata retention through prompt and confirmation failures, failure before/after database commit, and the one-session-runtime invariant.
+- Exact unavailable-session load preserving metadata and exposing Retry and Remove without `session/new` fallback.
 - Executable validation/persistence failure, global-auth reconciliation, disposal-before-publication, post-commit Swap Failed, and atomic owner publication.
 - Configuration success without effective persistence, timeout after mutation, cancellation at every boundary, worker crash, restoration timeout, stale response, effective-value mismatch, and one-option degradation.
 - Every migration-v1 constraint, foreign-key action, singleton setting, canonical path, UTC millisecond timestamp, store-level single-Thread invariant, migration failure, too-new schema, and recoverable directory backup.
 - Dirty Git baselines, spaces and Unicode, staged/unstaged edits, renames, deletions, binaries, submodules, non-regular files, and truncation.
+- Baseline success before the first prompt, prompt-before-capture and capture-failure degradation to current-only/Unknown, non-blocking prompting, stale capture rejection, and a fresh attribution attempt on Resume.
 
 Final app acceptance is:
 
 ```text
 New Thread
--> prompt with streaming, reasoning, tool, and live plan activity
+-> user-visible prompt with streaming, reasoning, tool, and live plan activity
+-> session/list confirms the exact Vibe session ID
+-> Thread metadata and selection commit
 -> quit
 -> relaunch with metadata only and no Vibe process
 -> explicit Resume
@@ -326,8 +348,10 @@ New Thread
 -> model/thinking change with fresh reload and effective-value assertion
 -> cancellation with complete descendant cleanup
 -> another follow-up
--> bounded Git inspection
+-> bounded Git inspection, with pre-existing attribution only when its baseline preceded the first prompt
 ```
+
+Failure-path acceptance also verifies that quitting a provisional New Thread before a persistence-producing prompt leaves no saved Thread, replacement retains the old selection until the confirmed candidate commits, and an unavailable stored session remains saved with Retry and Remove actions.
 
 Final validation commands are:
 
@@ -338,6 +362,8 @@ script/build_and_run.sh --verify
 
 The live ACP gate remains separate, explicit, and opt-in.
 
+The real-provider smoke test is also separate and opt-in. It runs only when `LECHATON_LIVE_PROVIDER_SMOKE=1` and requires `LECHATON_PROVIDER_BASE_URL`, `LECHATON_PROVIDER_MODEL_ID`, and either `LECHATON_PROVIDER_API_KEY` or `LECHATON_PROVIDER_KEYLESS=1`. `LECHATON_VIBE_EXECUTABLE` may override executable discovery. It is never part of the default deterministic suite or the Vibe compatibility gate.
+
 ## Assumptions and Deferrals
 
 - Authentication uses a separate lazy process; delegated start and complete remain on that process.
@@ -345,4 +371,4 @@ The live ACP gate remains separate, explicit, and opt-in.
 - Vibe remains transcript authority. LeChaton stores no conversation or plan content.
 - Plans are intentionally transient across Resume.
 - One-value configuration options degrade explicitly instead of failing overall compatibility.
-- Multiple user-accessible Threads/projects, repository relocation/import, rename/archive, multi-worktree UX, manual API keys, sign-out, attachments, Git mutations, distribution, and deletion of Vibe session data remain deferred.
+- Multiple user-accessible Threads/projects, repository relocation/import, rename/archive, multi-worktree UX, sign-out, attachments, Git mutations, distribution, and deletion of Vibe session data remain deferred.

@@ -35,6 +35,7 @@ let project = Project(
             sources: ["Sources/LeChatonCore/**"],
             dependencies: [
                 .external(name: "GRDB"),
+                .external(name: "TOMLKit"),
             ]
         ),
         .target(

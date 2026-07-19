@@ -9,6 +9,7 @@ struct WorkspaceRootView: View {
     @State private var selection: WorkspaceDestination? = .conversation
     @State private var threadDraft: ThreadCreationDraft?
     @State private var confirmsRemoval = false
+    @State private var confirmsDraftDiscard = false
     @State private var confirmsRuntimeReset = false
 
     var body: some View {
@@ -18,44 +19,53 @@ struct WorkspaceRootView: View {
         } detail: {
             detail
         }
-        .navigationTitle(workspace.model.selectedThread?.thread.title ?? "LeChaton")
-        .onChange(of: workspace.model.selectedThread?.thread.id) { _, threadID in
+        .navigationTitle(workspace.model.threadPresentation?.title ?? "LeChaton")
+        .onChange(of: workspace.model.threadPresentation?.id) { _, threadID in
             if threadID == nil {
                 selection = .conversation
             }
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if workspace.model.selectedThread == nil {
+                if let thread = workspace.model.threadPresentation {
+                    if thread.isProvisional {
+                        Button("Discard Draft", systemImage: "trash") {
+                            confirmsDraftDiscard = true
+                        }
+                        .tint(LeChatonTheme.danger)
+                        .disabled(!workspace.canDiscardDraftThread)
+                        .help("Stop the provisional Vibe session and discard this unsaved draft")
+                    } else {
+                        Button("Replace Thread", systemImage: "arrow.triangle.2.circlepath") {
+                            chooseRepository(for: .replace)
+                        }
+                        .disabled(!workspace.canReplaceThread)
+                        .help("Replace the saved Thread")
+
+                        Menu("Thread Actions", systemImage: "ellipsis.circle") {
+                            Button("Unload Runtime") {
+                                Task { await workspace.unload() }
+                            }
+                            .disabled(!workspace.canUnloadThread)
+
+                            Button("Reset Runtime…") { confirmsRuntimeReset = true }
+                                .disabled(!workspace.canResetRuntime)
+
+                            Divider()
+
+                            Button("Remove Saved Thread…", role: .destructive) {
+                                confirmsRemoval = true
+                            }
+                            .disabled(!workspace.canRemoveThread)
+                        }
+                        .menuIndicator(.hidden)
+                        .help("Thread actions")
+                    }
+                } else {
                     Button("New Thread", systemImage: "plus") { chooseRepository(for: .new) }
                         .tint(LeChatonTheme.orange)
                         .disabled(!workspace.canCreateThread)
                         .help("Create a Thread in a Git repository")
-                } else {
-                    Button("Replace Thread", systemImage: "arrow.triangle.2.circlepath") {
-                        chooseRepository(for: .replace)
-                    }
-                    .disabled(!workspace.canReplaceThread)
-                    .help("Replace the saved Thread")
-
-                    Menu("Thread Actions", systemImage: "ellipsis.circle") {
-                        Button("Unload Runtime") {
-                            Task { await workspace.unload() }
-                        }
-                        .disabled(workspace.model.lifecycle != .idle)
-
-                        Button("Reset Runtime…") { confirmsRuntimeReset = true }
-                            .disabled(!canResetRuntime)
-
-                        Divider()
-
-                        Button("Remove Saved Thread…", role: .destructive) {
-                            confirmsRemoval = true
-                        }
-                        .disabled(!workspace.canRemoveThread)
-                    }
-                    .menuIndicator(.hidden)
-                    .help("Thread actions")
                 }
 
                 SettingsLink {
@@ -117,6 +127,18 @@ struct WorkspaceRootView: View {
             Text("LeChaton will forget the Vibe session ID. Vibe’s own session files and repository are not deleted.")
         }
         .confirmationDialog(
+            "Discard the draft Thread?",
+            isPresented: $confirmsDraftDiscard,
+            titleVisibility: .visible
+        ) {
+            Button("Discard Draft", role: .destructive) {
+                Task { await workspace.discardDraftThread() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("LeChaton will stop the provisional Vibe process and forget this unsaved draft. Existing saved Thread metadata, if any, remains available.")
+        }
+        .confirmationDialog(
             "Reset the runtime?",
             isPresented: $confirmsRuntimeReset,
             titleVisibility: .visible
@@ -149,17 +171,11 @@ struct WorkspaceRootView: View {
                 workspace: workspace,
                 onNewThread: { chooseRepository(for: .new) },
                 onRemoveThread: { confirmsRemoval = true },
+                onDiscardDraft: { confirmsDraftDiscard = true },
                 onResetRuntime: { confirmsRuntimeReset = true }
             )
         case .changes:
             GitInspectionView(workspace: workspace)
-        }
-    }
-
-    private var canResetRuntime: Bool {
-        switch workspace.model.lifecycle {
-        case .idle, .unloaded, .failed, .reloadRequired: true
-        default: false
         }
     }
 

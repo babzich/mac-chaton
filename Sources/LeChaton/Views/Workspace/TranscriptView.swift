@@ -21,16 +21,8 @@ struct TranscriptView: View {
                         .frame(maxWidth: .infinity, minHeight: 320)
                     }
 
-                    ForEach(state.messages) { message in
-                        MessageRow(message: message)
-                    }
-
-                    if !state.reasoning.isEmpty {
-                        ReasoningGroup(reasoning: state.reasoning)
-                    }
-
-                    ForEach(state.orderedToolCalls) { tool in
-                        ToolCallRow(tool: tool)
+                    ForEach(state.transcriptOrder) { reference in
+                        transcriptItem(reference)
                     }
 
                     if !state.plan.isEmpty {
@@ -49,6 +41,24 @@ struct TranscriptView: View {
                 withAnimation(.easeOut(duration: 0.18)) {
                     proxy.scrollTo("transcript-bottom", anchor: .bottom)
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func transcriptItem(_ reference: SessionTranscriptItemReference) -> some View {
+        switch reference {
+        case let .message(role, id):
+            if let message = state.messages.first(where: { $0.role == role && $0.id == id }) {
+                MessageRow(message: message)
+            }
+        case let .reasoning(id):
+            if let reasoning = state.reasoning.first(where: { $0.id == id }) {
+                ReasoningRow(reasoning: reasoning)
+            }
+        case let .tool(id):
+            if let tool = state.toolCalls[id] {
+                ToolCallRow(tool: tool)
             }
         }
     }
@@ -93,19 +103,15 @@ private struct MessageRow: View {
     }
 }
 
-private struct ReasoningGroup: View {
-    let reasoning: [SessionReasoning]
+private struct ReasoningRow: View {
+    let reasoning: SessionReasoning
 
     var body: some View {
         DisclosureGroup {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(reasoning) { item in
-                    Text(item.text.isEmpty ? "Non-text reasoning content" : item.text)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .padding(.top, 8)
+            Text(reasoning.text.isEmpty ? "Non-text reasoning content" : reasoning.text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 8)
         } label: {
             Label("Reasoning", systemImage: "brain.head.profile")
                 .font(.callout.weight(.medium))

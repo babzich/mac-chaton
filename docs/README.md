@@ -29,7 +29,7 @@ Every ADR declares a date, scope, and lifecycle status:
 | Architecture principles and adding abstractions | [0001 Architecture Principles](./adr/0001-architecture-principles.md) |
 | Project targets, delivery surfaces, and dependency direction | [0002 Core And Delivery Surfaces](./adr/0002-core-and-delivery-surfaces.md) |
 | State, concurrency, cancellation, and runtime ownership | [0003 State And Concurrency Ownership](./adr/0003-state-and-concurrency-ownership.md) |
-| ACP, Vibe, Git, credentials, subprocesses, trust, and compatibility | [0004 External Integration Boundaries](./adr/0004-external-integration-boundaries.md) |
+| ACP, Vibe, providers, API keys, Vibe configuration, Git, subprocesses, trust, and compatibility | [0004 External Integration Boundaries](./adr/0004-external-integration-boundaries.md) |
 | Tuist, build/run workflow, and validation strategy | [0005 Project Generation And Validation](./adr/0005-project-generation-and-validation.md) |
 | Persistence ownership, migrations, durable metadata, session restoration, and database recovery | [0006 Persistence And Session Restoration](./adr/0006-persistence-and-session-restoration.md) |
 

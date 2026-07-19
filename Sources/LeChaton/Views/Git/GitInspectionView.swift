@@ -41,7 +41,7 @@ struct GitInspectionView: View {
                     )
                 } description: {
                     if workspace.model.canResume {
-                        Text("The Git baseline is captured after a successful Resume or New Thread.")
+                        Text("Resume the Thread before inspecting repository changes.")
                     } else {
                         Text("Finish the current Thread activity before inspecting repository changes.")
                     }
@@ -53,24 +53,24 @@ struct GitInspectionView: View {
                             .foregroundStyle(LeChatonTheme.onAccent)
                     }
                 }
+            } else if workspace.git.isLoading {
+                ProgressView("Inspecting repository…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let errorMessage = workspace.git.errorMessage {
                 ContentUnavailableView {
                     Label("Git inspection failed", systemImage: "exclamationmark.triangle")
                 } description: {
                     Text(errorMessage)
                 } actions: {
-                    Button("Try Again") { Task { await workspace.refreshGit() } }
+                    Button("Retry Inspection") { Task { await workspace.refreshGit() } }
                 }
             } else if let inspection = workspace.git.inspection {
-                inspectionContent(inspection)
-            } else if workspace.git.isLoading {
-                ProgressView("Inspecting repository…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                inspectionBody(inspection)
             } else {
                 ContentUnavailableView {
                     Label("Changes not inspected yet", systemImage: "arrow.triangle.branch")
                 } description: {
-                    Text("Refresh compares the current worktree with the baseline captured when this runtime loaded.")
+                    Text("Inspect the current working tree for staged, unstaged, and untracked changes.")
                 } actions: {
                     Button("Inspect Changes") { Task { await workspace.refreshGit() } }
                         .buttonStyle(.borderedProminent)
@@ -80,15 +80,18 @@ struct GitInspectionView: View {
             }
         }
         .leChatonDetailCanvas()
-        .task {
-            if workspace.model.lifecycle == .idle, workspace.git.inspection == nil {
+        .task(id: workspace.git.baseline != nil) {
+            if workspace.model.lifecycle == .idle,
+               !workspace.git.isLoading,
+               workspace.git.inspection == nil
+            {
                 await workspace.refreshGit()
             }
         }
     }
 
     @ViewBuilder
-    private func inspectionContent(_ inspection: GitInspection) -> some View {
+    private func inspectionBody(_ inspection: GitInspection) -> some View {
         if inspection.files.isEmpty {
             ContentUnavailableView(
                 "Working tree is clean",
@@ -107,8 +110,8 @@ struct GitInspectionView: View {
                                 .lineLimit(1)
                             Spacer()
                         }
-                        if file.wasDirtyAtBaseline {
-                            Text("Pre-existing at baseline")
+                        if file.baselineAttribution == .preExisting {
+                            Text("Pre-existing")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -160,7 +163,9 @@ struct GitInspectionView: View {
         var parts = [file.status.path]
         if file.status.hasStagedChange { parts.append("staged") }
         if file.status.hasUnstagedChange { parts.append("unstaged") }
-        if file.wasDirtyAtBaseline { parts.append("pre-existing at baseline") }
+        if file.baselineAttribution == .preExisting {
+            parts.append("pre-existing")
+        }
         return parts.joined(separator: ", ")
     }
 }
@@ -179,8 +184,8 @@ private struct GitFileDiffView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    if file.wasDirtyAtBaseline {
-                        Label("This path was already dirty when the runtime loaded.", systemImage: "clock")
+                    if file.baselineAttribution == .preExisting {
+                        Label("Pre-existing", systemImage: "clock")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

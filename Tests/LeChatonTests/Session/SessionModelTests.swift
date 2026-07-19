@@ -164,6 +164,159 @@ struct SessionModelTests {
         #expect(model.issue?.actions.contains(.retry) == true)
     }
 
+    @Test("An exact missing Vibe session keeps saved metadata and offers explicit removal")
+    func missingSavedSessionIsTypedRecovery() async throws {
+        let repository = try TestRepository(name: "missing-vibe-session")
+        defer { repository.remove() }
+        let metadata = makeMetadata(repositoryURL: repository.url)
+        let runtime = FakeSessionRuntime(
+            loadError: VibeAdapterError.savedSessionUnavailable(metadata.thread.vibeSessionID)
+        )
+        let model = makeRestorableModel(
+            metadata: metadata,
+            persistence: FakeSessionPersistence(metadata: metadata),
+            runtimes: [runtime]
+        )
+
+        await model.restoreLaunchMetadata()
+        await model.resume()
+
+        #expect(isFailed(model.lifecycle))
+        #expect(model.selectedThread == metadata)
+        #expect(model.sessionState == SessionState())
+        #expect(model.issue?.kind == .savedSessionUnavailable)
+        #expect(model.issue?.actions == [.retry, .removeSavedThread])
+    }
+
+    @Test("A new Thread stays provisional until Vibe lists it after a prompt")
+    func newThreadCommitsOnlyAfterDurabilityConfirmation() async throws {
+        let repository = try TestRepository(name: "provisional")
+        defer { repository.remove() }
+        let runtime = FakeSessionRuntime(persistedSessionAvailable: false)
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([runtime]),
+            authFactory: LockedAuthQueue([])
+        ))
+
+        await model.restoreLaunchMetadata()
+        await model.createThread(repositoryURL: repository.url, title: "Draft")
+
+        #expect(model.selectedThread == nil)
+        #expect(model.provisionalThread?.title == "Draft")
+        #expect(model.canPrompt)
+        #expect(await persistence.createCallCount == 0)
+
+        _ = try await model.sendPrompt("A command that Vibe did not persist")
+        #expect(model.selectedThread == nil)
+        #expect(model.provisionalThread != nil)
+        #expect(await persistence.createCallCount == 0)
+        #expect(model.issue?.actions == [.retryThreadSave, .discardDraftThread])
+
+        await runtime.setPersistedSessionAvailable(true)
+        await model.retryThreadSave()
+
+        #expect(model.provisionalThread == nil)
+        #expect(model.selectedThread?.thread.title == "Draft")
+        #expect(await persistence.createCallCount == 1)
+        await model.shutdown()
+    }
+
+    @Test("Durability confirmation is non-cancellable and blocks overlapping prompts")
+    func durabilityConfirmationIsNonInteractive() async throws {
+        let repository = try TestRepository(name: "durability-in-flight")
+        defer { repository.remove() }
+        let runtime = FakeSessionRuntime(holdPersistedSessionCheck: true)
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([runtime]),
+            authFactory: LockedAuthQueue([])
+        ))
+
+        await model.restoreLaunchMetadata()
+        await model.createThread(repositoryURL: repository.url, title: "Durability")
+        let prompt = Task { try await model.sendPrompt("Persist this Thread") }
+        await waitUntil { await runtime.persistedSessionCheckIsWaiting }
+
+        #expect(model.lifecycle == .replacingThread)
+        #expect(!model.canPrompt)
+        #expect(model.provisionalThread != nil)
+
+        await runtime.releasePersistedSessionCheck()
+        _ = try await prompt.value
+
+        #expect(model.lifecycle == .idle)
+        #expect(model.provisionalThread == nil)
+        #expect(model.selectedThread?.thread.title == "Durability")
+        await model.shutdown()
+    }
+
+    @Test("A metadata write failure keeps the durable Vibe draft usable and discardable")
+    func provisionalPersistenceFailureIsRecoverable() async throws {
+        let repository = try TestRepository(name: "draft-write-failure")
+        defer { repository.remove() }
+        let runtime = FakeSessionRuntime()
+        let persistence = FakeSessionPersistence(
+            snapshot: .init(
+                settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+                selectedThread: nil
+            ),
+            writeError: .noSavedThread
+        )
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([runtime]),
+            authFactory: LockedAuthQueue([])
+        ))
+
+        await model.restoreLaunchMetadata()
+        await model.createThread(repositoryURL: repository.url, title: "Recoverable Draft")
+        _ = try await model.sendPrompt("Persist this conversation")
+
+        #expect(model.lifecycle == .idle)
+        #expect(model.canPrompt)
+        #expect(model.selectedThread == nil)
+        #expect(model.provisionalThread?.title == "Recoverable Draft")
+        #expect(model.issue?.kind == .persistence)
+        #expect(model.issue?.actions == [.retryThreadSave, .discardDraftThread])
+
+        await model.discardDraftThread()
+        #expect(model.lifecycle == .unloaded)
+        #expect(model.provisionalThread == nil)
+        #expect(await runtime.cleanupAttemptCount == 1)
+    }
+
+    @Test("Closing a draft before its first prompt never creates saved metadata")
+    func emptyDraftShutdownDoesNotPersist() async throws {
+        let repository = try TestRepository(name: "empty-draft")
+        defer { repository.remove() }
+        let runtime = FakeSessionRuntime()
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([runtime]),
+            authFactory: LockedAuthQueue([])
+        ))
+
+        await model.restoreLaunchMetadata()
+        await model.createThread(repositoryURL: repository.url, title: "Unsaved")
+        #expect(model.provisionalThread != nil)
+
+        #expect(await model.shutdown())
+        #expect(await persistence.createCallCount == 0)
+    }
+
     @Test("Thread replacement verifies old cleanup before creating the sole replacement runtime")
     func replacementCleanupBeforeCreate() async throws {
         let oldRepository = try TestRepository(name: "old")
@@ -199,16 +352,66 @@ struct SessionModelTests {
         await model.replaceSavedThread(repositoryURL: newRepository.url, title: "Replacement")
 
         #expect(model.lifecycle == .idle)
-        #expect(model.selectedThread?.thread.vibeSessionID == "new-session-replacement")
-        let events = await log.events
+        #expect(model.selectedThread == metadata)
+        #expect(model.provisionalThread?.vibeSessionID == "new-session-replacement")
+        #expect(model.provisionalThread?.isProvisional == true)
+        var events = await log.events
         let oldStop = try #require(events.firstIndex(of: "old.stop"))
         let replacementStart = try #require(events.firstIndex(of: "replacement.start"))
         let replacementNew = try #require(events.firstIndex(of: "replacement.new"))
-        let commit = try #require(events.firstIndex(of: "persistence.replace"))
+        #expect(events.firstIndex(of: "persistence.replace") == nil)
         #expect(oldStop < replacementStart)
         #expect(replacementStart < replacementNew)
+
+        _ = try await model.sendPrompt("Persist the replacement")
+
+        #expect(model.selectedThread?.thread.vibeSessionID == "new-session-replacement")
+        #expect(model.provisionalThread == nil)
+        events = await log.events
+        let commit = try #require(events.firstIndex(of: "persistence.replace"))
         #expect(replacementNew < commit)
         await model.shutdown()
+    }
+
+    @Test("A replacement write failure keeps the old Thread durable until draft discard")
+    func replacementPersistenceFailureRetainsOldSelection() async throws {
+        let oldRepository = try TestRepository(name: "old-write-failure")
+        let newRepository = try TestRepository(name: "new-write-failure")
+        defer {
+            oldRepository.remove()
+            newRepository.remove()
+        }
+        let metadata = makeMetadata(repositoryURL: oldRepository.url)
+        let persistence = FakeSessionPersistence(metadata: metadata, writeError: .noSavedThread)
+        let attempt = UUID()
+        let oldRuntime = FakeSessionRuntime(loadBehavior: .success(
+            attemptID: attempt,
+            events: [],
+            barrierAttemptID: attempt,
+            throughSequence: 0,
+            configurationOptions: []
+        ))
+        let replacementRuntime = FakeSessionRuntime(label: "replacement-write-failure")
+        let model = makeRestorableModel(
+            metadata: metadata,
+            persistence: persistence,
+            runtimes: [oldRuntime, replacementRuntime]
+        )
+
+        await model.restoreLaunchMetadata()
+        await model.resume()
+        await model.replaceSavedThread(repositoryURL: newRepository.url, title: "Candidate")
+        _ = try await model.sendPrompt("Persist replacement")
+
+        #expect(model.lifecycle == .idle)
+        #expect(model.selectedThread == metadata)
+        #expect(model.provisionalThread?.title == "Candidate")
+        #expect(model.issue?.actions == [.retryThreadSave, .discardDraftThread])
+
+        await model.discardDraftThread()
+        #expect(model.lifecycle == .unloaded)
+        #expect(model.selectedThread == metadata)
+        #expect(model.provisionalThread == nil)
     }
 
     @Test("Executable swap persists, disposes old owners, then atomically publishes candidate")
@@ -261,6 +464,40 @@ struct SessionModelTests {
         #expect(persisted < runtimeStopped)
         #expect(runtimeStopped < authStopped)
         #expect(authStopped < promoted)
+        await model.shutdown()
+    }
+
+    @Test("Provider activation disposes owners before committing and requires Resume")
+    func providerActivationOrder() async throws {
+        let repository = try TestRepository(name: "provider-activation")
+        defer { repository.remove() }
+        let metadata = makeMetadata(repositoryURL: repository.url)
+        let log = OperationLog()
+        let runtime = FakeSessionRuntime(label: "provider-session", log: log)
+        let auth = FakeAuthenticationOwner(label: "provider-auth", log: log)
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: FakeSessionPersistence(metadata: metadata),
+            runtimeFactory: LockedRuntimeQueue([runtime]),
+            authFactory: LockedAuthQueue([auth]),
+            activateProviderModel: { _, _ in
+                await log.append("provider.commit")
+            }
+        ))
+        await model.restoreLaunchMetadata()
+        await model.resume()
+
+        try await model.activateProviderModel(providerID: UUID(), modelID: UUID())
+
+        #expect(model.lifecycle == .unloaded)
+        #expect(model.selectedThread == metadata)
+        #expect(model.sessionState == SessionState())
+        #expect(model.canResume)
+        let events = await log.events
+        let runtimeStopped = try #require(events.firstIndex(of: "provider-session.stop"))
+        let authStopped = try #require(events.firstIndex(of: "provider-auth.dispose"))
+        let committed = try #require(events.firstIndex(of: "provider.commit"))
+        #expect(runtimeStopped < authStopped)
+        #expect(authStopped < committed)
         await model.shutdown()
     }
 
@@ -549,6 +786,38 @@ struct SessionModelTests {
         #expect(model.selectedThread == nil)
     }
 
+    @Test("Shutdown cancels provider activation and prevents stale publication")
+    func shutdownInvalidatesProviderActivation() async {
+        let activator = SuspendedProviderActivator()
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([]),
+            authFactory: LockedAuthQueue([]),
+            activateProviderModel: { providerID, modelID in
+                try await activator.activate(providerID: providerID, modelID: modelID)
+            }
+        ))
+        await model.restoreLaunchMetadata()
+
+        let activation = Task {
+            try? await model.activateProviderModel(providerID: UUID(), modelID: UUID())
+        }
+        await waitUntil { await activator.isWaiting }
+
+        let canTerminate = await model.shutdown()
+        await activation.value
+
+        #expect(canTerminate)
+        #expect(await activator.cancellationCount == 1)
+        #expect(await activator.isWaiting == false)
+        #expect(model.lifecycle == .unloaded)
+        #expect(model.activity == nil)
+    }
+
     @Test("Shutdown disposes a private candidate before validation can publish it")
     func shutdownInvalidatesSuspendedCandidateValidation() async {
         let promotedOwner = FakeAuthenticationOwner(label: "unused-promotion")
@@ -657,11 +926,53 @@ struct SessionModelTests {
         await model.resolveRepositoryTrust(decision: "trust_repo")
 
         #expect(model.lifecycle == .idle)
+        #expect(model.selectedThread == nil)
+        #expect(model.provisionalThread?.title == "Trust Project")
+        _ = try await model.sendPrompt("Persist this Thread")
         #expect(model.selectedThread?.thread.title == "Trust Project")
         let canonicalRepository = try await RepositoryValidator().validate(repository.url)
         #expect(model.selectedThread?.environment.cwd == canonicalRepository.path)
         #expect(await resolver.appliedTrustDecisions == ["trust_repo"])
         #expect(await final.newSessionCallCount == 1)
+        await model.shutdown()
+    }
+
+    @Test("An untrusted repository without trust-sensitive files starts without a decision")
+    func repositoryWithoutTrustPromptContinuesNewThread() async throws {
+        let repository = try TestRepository(name: "trust-not-required")
+        defer { repository.remove() }
+        let runtime = FakeSessionRuntime(
+            trustStatus: untrustedRepositoryStatusWithoutPrompt()
+        )
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([runtime]),
+            authFactory: LockedAuthQueue([])
+        ))
+
+        await model.restoreLaunchMetadata()
+        await model.createThread(repositoryURL: repository.url, title: "Plain Project")
+
+        #expect(model.lifecycle == .idle)
+        #expect(model.selectedThread == nil)
+        #expect(model.provisionalThread?.title == "Plain Project")
+        #expect(model.issue == nil)
+        #expect(!model.hasPendingRepositoryTrustAction)
+        #expect(await runtime.newSessionCallCount == 1)
+        #expect(await runtime.appliedTrustDecisions.isEmpty)
+        guard case let .status(status) = model.trust else {
+            Issue.record("Expected Vibe's non-actionable untrusted status to remain visible")
+            await model.shutdown()
+            return
+        }
+        #expect(status.state == .untrusted)
+        #expect(status.allowsSessionStart)
+        _ = try await model.sendPrompt("Persist this Thread")
+        #expect(model.selectedThread?.thread.title == "Plain Project")
         await model.shutdown()
     }
 
@@ -696,6 +1007,9 @@ struct SessionModelTests {
         await model.retryPendingRepositoryTrust()
 
         #expect(model.lifecycle == .idle)
+        #expect(model.selectedThread == nil)
+        #expect(model.provisionalThread?.title == "Externally Trusted")
+        _ = try await model.sendPrompt("Persist this Thread")
         #expect(model.selectedThread?.thread.title == "Externally Trusted")
         #expect(!model.hasPendingRepositoryTrustAction)
         #expect(await recovered.newSessionCallCount == 1)
@@ -813,12 +1127,16 @@ private actor FakeSessionRuntime: SessionRuntime {
     private let holdPrompt: Bool
     private let holdPermissionResponse: Bool
     private let holdCleanup: Bool
+    private let holdPersistedSessionCheck: Bool
     private let configurationError: ACPTransportError?
+    private let loadError: (any Error & Sendable)?
     private let trustStatus: VibeRepositoryTrustStatus
     private let trustDecisionStatus: VibeRepositoryTrustStatus
+    private var persistedSessionAvailable: Bool
     private var startContinuation: CheckedContinuation<Void, Never>?
     private var promptContinuation: CheckedContinuation<PromptResult, Never>?
     private var permissionContinuation: CheckedContinuation<Void, Never>?
+    private var persistedSessionContinuation: CheckedContinuation<Void, Never>?
     private(set) var selectedPermissionReplies: [RPCID] = []
     private(set) var appliedTrustDecisions: [String] = []
     private var cleanupReports: [ProcessCleanupReport]
@@ -833,7 +1151,10 @@ private actor FakeSessionRuntime: SessionRuntime {
         holdPrompt: Bool = false,
         holdPermissionResponse: Bool = false,
         holdCleanup: Bool = false,
+        holdPersistedSessionCheck: Bool = false,
         configurationError: ACPTransportError? = nil,
+        loadError: (any Error & Sendable)? = nil,
+        persistedSessionAvailable: Bool = true,
         cleanupReports: [ProcessCleanupReport] = [],
         trustStatus: VibeRepositoryTrustStatus = trustedRepositoryStatus(),
         trustDecisionStatus: VibeRepositoryTrustStatus = trustedRepositoryStatus()
@@ -852,7 +1173,10 @@ private actor FakeSessionRuntime: SessionRuntime {
         self.holdPrompt = holdPrompt
         self.holdPermissionResponse = holdPermissionResponse
         self.holdCleanup = holdCleanup
+        self.holdPersistedSessionCheck = holdPersistedSessionCheck
         self.configurationError = configurationError
+        self.loadError = loadError
+        self.persistedSessionAvailable = persistedSessionAvailable
         self.trustStatus = trustStatus
         self.trustDecisionStatus = trustDecisionStatus
         self.cleanupReports = cleanupReports
@@ -897,8 +1221,28 @@ private actor FakeSessionRuntime: SessionRuntime {
         )
     }
 
+    func persistedSessionExists(sessionID _: String, cwd _: URL) async throws -> Bool {
+        await log?.append("\(label).list")
+        if holdPersistedSessionCheck {
+            await withCheckedContinuation { persistedSessionContinuation = $0 }
+        }
+        return persistedSessionAvailable
+    }
+
+    func setPersistedSessionAvailable(_ available: Bool) {
+        persistedSessionAvailable = available
+    }
+
+    var persistedSessionCheckIsWaiting: Bool { persistedSessionContinuation != nil }
+
+    func releasePersistedSessionCheck() {
+        persistedSessionContinuation?.resume()
+        persistedSessionContinuation = nil
+    }
+
     func loadSession(sessionID _: String, cwd _: URL) async throws -> LoadSessionResult {
         await log?.append("\(label).load")
+        if let loadError { throw loadError }
         switch loadBehavior {
         case let .success(attemptID, events, barrierAttemptID, throughSequence, options, finish):
             yield(events, attemptID: attemptID)
@@ -956,6 +1300,8 @@ private actor FakeSessionRuntime: SessionRuntime {
         updateContinuation.finish()
         requestContinuation.finish()
         diagnosticContinuation.finish()
+        persistedSessionContinuation?.resume()
+        persistedSessionContinuation = nil
         if holdCleanup { await waitForCleanupRelease() }
         return nextCleanupReport()
     }
@@ -1156,21 +1502,27 @@ private actor FakeSessionPersistence {
     private var snapshot: PersistenceSnapshot
     private let log: OperationLog?
     private let closeError: SessionModelError?
+    private let writeError: SessionModelError?
+    private(set) var createCallCount = 0
+    private(set) var replaceCallCount = 0
 
     init(
         snapshot: PersistenceSnapshot,
         log: OperationLog? = nil,
-        closeError: SessionModelError? = nil
+        closeError: SessionModelError? = nil,
+        writeError: SessionModelError? = nil
     ) {
         self.snapshot = snapshot
         self.log = log
         self.closeError = closeError
+        self.writeError = writeError
     }
 
     init(
         metadata: SavedThreadMetadata,
         log: OperationLog? = nil,
-        closeError: SessionModelError? = nil
+        closeError: SessionModelError? = nil,
+        writeError: SessionModelError? = nil
     ) {
         snapshot = .init(
             settings: .init(
@@ -1181,6 +1533,7 @@ private actor FakeSessionPersistence {
         )
         self.log = log
         self.closeError = closeError
+        self.writeError = writeError
     }
 
     nonisolated func client() -> SessionPersistenceClient {
@@ -1204,6 +1557,8 @@ private actor FakeSessionPersistence {
     private func snapshotValue() -> PersistenceSnapshot { snapshot }
 
     private func create(_ request: CreateThreadRequest) throws -> SavedThreadMetadata {
+        createCallCount += 1
+        if let writeError { throw writeError }
         let metadata = metadata(from: request)
         snapshot = .init(
             settings: .init(selectedVibePath: snapshot.settings.selectedVibePath, selectedThreadID: request.threadID),
@@ -1214,6 +1569,7 @@ private actor FakeSessionPersistence {
 
     private func replace(oldID: UUID, request: CreateThreadRequest) async throws -> SavedThreadMetadata {
         guard snapshot.settings.selectedThreadID == oldID else { throw SessionModelError.noSavedThread }
+        replaceCallCount += 1
         await log?.append("persistence.replace")
         return try create(request)
     }
@@ -1289,6 +1645,22 @@ private actor SuspendedRepositoryValidator {
             throw CancellationError()
         }
         return CanonicalRepository(path: url.path)
+    }
+}
+
+private actor SuspendedProviderActivator {
+    private(set) var isWaiting = false
+    private(set) var cancellationCount = 0
+
+    func activate(providerID _: UUID, modelID _: UUID) async throws {
+        isWaiting = true
+        defer { isWaiting = false }
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch is CancellationError {
+            cancellationCount += 1
+            throw CancellationError()
+        }
     }
 }
 
@@ -1403,7 +1775,8 @@ private func makeDependencies(
     },
     validateExecutable: @escaping @Sendable (URL) throws -> VibeExecutable = { url in
         testExecutable(path: url.path)
-    }
+    },
+    activateProviderModel: @escaping @Sendable (UUID, UUID) async throws -> Void = { _, _ in }
 ) -> SessionModelDependencies {
     .init(
         persistence: persistence.client(),
@@ -1412,7 +1785,8 @@ private func makeDependencies(
         validateExecutable: validateExecutable,
         makeRuntime: { _, _ in runtimeFactory.next() },
         makeAuthenticationOwner: { _ in authFactory.next() },
-        makeAuthenticationCandidate: { _ in candidateFactory.next() }
+        makeAuthenticationCandidate: { _ in candidateFactory.next() },
+        activateProviderModel: activateProviderModel
     )
 }
 
@@ -1471,6 +1845,13 @@ private func untrustedRepositoryStatusWithoutChoices(cwd: URL) -> VibeRepository
     ]))
 }
 
+private func untrustedRepositoryStatusWithoutPrompt() -> VibeRepositoryTrustStatus {
+    .init(raw: .object([
+        "trust_status": .string("untrusted"),
+        "details": .null,
+    ]))
+}
+
 private func configurationOption(current: String) -> JSONValue {
     .object([
         "id": .string("model"),
@@ -1498,7 +1879,10 @@ private func testCompatibility(executable: VibeExecutable = testExecutable()) ->
                 title: "Vibe",
                 version: VibeCompatibility.supportedVersion
             ),
-            agentCapabilities: .object(["loadSession": .bool(true)]),
+            agentCapabilities: .object([
+                "loadSession": .bool(true),
+                "sessionCapabilities": .object(["list": .object([:])]),
+            ]),
             authenticationMethods: [],
             metadata: nil,
             raw: .object([:])

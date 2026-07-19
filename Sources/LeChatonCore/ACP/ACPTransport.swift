@@ -120,6 +120,53 @@ public struct LoadSessionResult: Equatable, Sendable {
     public let raw: JSONValue
 }
 
+public struct ACPSessionInfo: Equatable, Sendable {
+    public let sessionID: String
+    public let cwd: String
+    public let additionalDirectories: [String]
+    public let title: String?
+    public let updatedAt: String?
+    public let metadata: JSONValue?
+    public let raw: JSONValue
+
+    public init(
+        sessionID: String,
+        cwd: String,
+        additionalDirectories: [String],
+        title: String?,
+        updatedAt: String?,
+        metadata: JSONValue?,
+        raw: JSONValue
+    ) {
+        self.sessionID = sessionID
+        self.cwd = cwd
+        self.additionalDirectories = additionalDirectories
+        self.title = title
+        self.updatedAt = updatedAt
+        self.metadata = metadata
+        self.raw = raw
+    }
+}
+
+public struct ListSessionsResult: Equatable, Sendable {
+    public let sessions: [ACPSessionInfo]
+    public let nextCursor: String?
+    public let metadata: JSONValue?
+    public let raw: JSONValue
+
+    public init(
+        sessions: [ACPSessionInfo],
+        nextCursor: String?,
+        metadata: JSONValue?,
+        raw: JSONValue
+    ) {
+        self.sessions = sessions
+        self.nextCursor = nextCursor
+        self.metadata = metadata
+        self.raw = raw
+    }
+}
+
 public enum PromptStopReason: Equatable, Hashable, Sendable {
     case endTurn
     case maxTokens
@@ -480,6 +527,55 @@ public actor ACPTransport {
             failTransport(error as? ACPTransportError ?? .protocolViolation(String(describing: error)))
             throw error
         }
+    }
+
+    public func listSessions(cwd: URL? = nil, cursor: String? = nil) async throws -> ListSessionsResult {
+        var parameters: [String: JSONValue] = [:]
+        if let cwd { parameters["cwd"] = .string(cwd.path) }
+        if let cursor { parameters["cursor"] = .string(cursor) }
+
+        let result = try await request(
+            method: "session/list",
+            params: .object(parameters)
+        )
+        guard
+            let object = result.objectValue,
+            let rawSessions = object["sessions"]?.arrayValue
+        else { throw ACPTransportError.invalidResponse(method: "session/list") }
+
+        let sessions = try rawSessions.map { raw in
+            guard
+                let session = raw.objectValue,
+                let sessionID = session["sessionId"]?.stringValue,
+                !sessionID.isEmpty,
+                let cwd = session["cwd"]?.stringValue,
+                cwd.hasPrefix("/")
+            else { throw ACPTransportError.invalidResponse(method: "session/list") }
+
+            let additionalDirectories = try decodeOptionalStringArray(
+                session["additionalDirectories"],
+                method: "session/list"
+            )
+            guard additionalDirectories.allSatisfy({ $0.hasPrefix("/") }) else {
+                throw ACPTransportError.invalidResponse(method: "session/list")
+            }
+            return ACPSessionInfo(
+                sessionID: sessionID,
+                cwd: cwd,
+                additionalDirectories: additionalDirectories,
+                title: try decodeOptionalString(session["title"], method: "session/list"),
+                updatedAt: try decodeOptionalString(session["updatedAt"], method: "session/list"),
+                metadata: session["_meta"],
+                raw: raw
+            )
+        }
+
+        return ListSessionsResult(
+            sessions: sessions,
+            nextCursor: try decodeOptionalString(object["nextCursor"], method: "session/list"),
+            metadata: object["_meta"],
+            raw: result
+        )
     }
 
     public func prompt(sessionID: String, text: String) async throws -> PromptResult {
@@ -1415,6 +1511,39 @@ private func decodeOptionalArray(
         []
     case let .some(.array(values)):
         values
+    default:
+        throw ACPTransportError.invalidResponse(method: method)
+    }
+}
+
+private func decodeOptionalString(
+    _ value: JSONValue?,
+    method: String
+) throws -> String? {
+    switch value {
+    case nil, .some(.null):
+        nil
+    case let .some(.string(string)):
+        string
+    default:
+        throw ACPTransportError.invalidResponse(method: method)
+    }
+}
+
+private func decodeOptionalStringArray(
+    _ value: JSONValue?,
+    method: String
+) throws -> [String] {
+    switch value {
+    case nil, .some(.null):
+        []
+    case let .some(.array(values)):
+        try values.map { value in
+            guard let string = value.stringValue else {
+                throw ACPTransportError.invalidResponse(method: method)
+            }
+            return string
+        }
     default:
         throw ACPTransportError.invalidResponse(method: method)
     }

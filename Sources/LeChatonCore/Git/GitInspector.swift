@@ -98,27 +98,39 @@ public struct GitDiffSection: Equatable, Sendable, Identifiable {
     }
 }
 
+public enum GitBaselineAttribution: Equatable, Sendable {
+    case preExisting
+    case notPreExisting
+    case unknown
+}
+
 public struct GitFileInspection: Equatable, Sendable, Identifiable {
     public var id: String { status.path }
 
     public let status: GitStatusEntry
-    public let wasDirtyAtBaseline: Bool
+    public let baselineAttribution: GitBaselineAttribution
     public let sections: [GitDiffSection]
 
-    public init(status: GitStatusEntry, wasDirtyAtBaseline: Bool, sections: [GitDiffSection]) {
+    public init(
+        status: GitStatusEntry,
+        baselineAttribution: GitBaselineAttribution,
+        sections: [GitDiffSection]
+    ) {
         self.status = status
-        self.wasDirtyAtBaseline = wasDirtyAtBaseline
+        self.baselineAttribution = baselineAttribution
         self.sections = sections
     }
+
+    public var wasDirtyAtBaseline: Bool { baselineAttribution == .preExisting }
 }
 
 public struct GitInspection: Equatable, Sendable {
-    public let baseline: GitStatusSnapshot
+    public let baseline: GitStatusSnapshot?
     public let current: GitStatusSnapshot
     public let files: [GitFileInspection]
 
     public init(
-        baseline: GitStatusSnapshot,
+        baseline: GitStatusSnapshot?,
         current: GitStatusSnapshot,
         files: [GitFileInspection]
     ) {
@@ -234,28 +246,44 @@ public actor GitInspector {
 
     public func inspect(
         repository: URL,
-        baseline: GitStatusSnapshot
+        baseline: GitStatusSnapshot?
     ) async throws -> GitInspection {
         let root = try await validateRepository(repository)
-        guard baseline.repositoryRoot.standardizedFileURL.resolvingSymlinksInPath().path == root.path else {
-            throw GitInspectionError.repositoryRootMismatch(
-                expected: root.path,
-                reported: baseline.repositoryRoot.path
-            )
+        if let baseline {
+            guard baseline.repositoryRoot.standardizedFileURL.resolvingSymlinksInPath().path == root.path else {
+                throw GitInspectionError.repositoryRootMismatch(
+                    expected: root.path,
+                    reported: baseline.repositoryRoot.path
+                )
+            }
         }
         let current = try await captureStatus(root: root)
-        let baselinePaths = Set(baseline.entries.flatMap { [$0.path, $0.originalPath].compactMap { $0 } })
+        let baselinePaths = baseline.map {
+            Set($0.entries.flatMap { [$0.path, $0.originalPath].compactMap { $0 } })
+        }
         var files: [GitFileInspection] = []
         for entry in current.entries {
             try Task.checkCancellation()
             files.append(GitFileInspection(
                 status: entry,
-                wasDirtyAtBaseline: baselinePaths.contains(entry.path)
-                    || entry.originalPath.map(baselinePaths.contains) == true,
+                baselineAttribution: baselineAttribution(
+                    for: entry,
+                    baselinePaths: baselinePaths
+                ),
                 sections: try await renderSections(entry: entry, root: root)
             ))
         }
         return GitInspection(baseline: baseline, current: current, files: files)
+    }
+
+    private func baselineAttribution(
+        for entry: GitStatusEntry,
+        baselinePaths: Set<String>?
+    ) -> GitBaselineAttribution {
+        guard let baselinePaths else { return .unknown }
+        let wasDirty = baselinePaths.contains(entry.path)
+            || entry.originalPath.map(baselinePaths.contains) == true
+        return wasDirty ? .preExisting : .notPreExisting
     }
 
     private func captureStatus(root: URL) async throws -> GitStatusSnapshot {

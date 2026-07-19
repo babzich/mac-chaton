@@ -30,6 +30,7 @@ struct VibeAdapterTests {
             "wrong-version",
             "wrong-agent",
             "missing-load-capability",
+            "missing-list-capability",
             "protocol-two",
         ]
         for scenario in scenarios {
@@ -79,6 +80,26 @@ struct VibeAdapterTests {
         #expect(!ProcessInspector.isAlive(root))
     }
 
+    @Test("Authentication status sees only its explicitly injected provider key")
+    func providerAuthenticationEnvironment() async throws {
+        var environment = try fakeProcessOptions(scenario: "auth-provider-environment").environment ?? [:]
+        environment["LECHATON_TEST_PROVIDER_KEY"] = "provider-secret"
+        let authenticated = AuthCoordinator(
+            executable: try fakeVibeExecutable(),
+            neutralWorkingDirectory: repositoryURL,
+            processOptions: .init(
+                arguments: ["--scenario", "auth-provider-environment"],
+                environment: environment
+            )
+        )
+        #expect(try await authenticated.authenticationStatus().state == .authenticated)
+        _ = try await authenticated.dispose()
+
+        let missing = try makeCoordinator(scenario: "auth-provider-environment")
+        #expect(try await missing.authenticationStatus().state == .unauthenticated)
+        _ = try await missing.dispose()
+    }
+
     @Test("Auth status decoding tolerates legacy, unknown, and future response shapes")
     func tolerantAuthenticationStatus() {
         let authoritative = VibeAuthenticationStatus(raw: .object([
@@ -103,6 +124,126 @@ struct VibeAdapterTests {
         #expect(VibeAuthenticationStatus(raw: .string("future-shape")).state == .unknown(rawValue: nil))
     }
 
+    @Test("Persisted-session lookup follows ACP pagination and matches both ID and cwd")
+    func persistedSessionLookup() async throws {
+        let adapter = VibeAdapter()
+        let validated = try await adapter.launchValidatedAuthenticationProcess(
+            executable: try fakeVibeExecutable(),
+            workingDirectory: repositoryURL,
+            processOptions: try fakeProcessOptions(scenario: "session-list-paginated")
+        )
+
+        let exists = try await adapter.persistedSessionExists(
+            sessionID: "persisted-session",
+            cwd: repositoryURL,
+            transport: validated.transport
+        )
+        let missing = try await adapter.persistedSessionExists(
+            sessionID: "missing-session",
+            cwd: repositoryURL,
+            transport: validated.transport
+        )
+        let wrongCWD = try await adapter.persistedSessionExists(
+            sessionID: "persisted-session",
+            cwd: repositoryURL.appending(path: "different-worktree", directoryHint: .isDirectory),
+            transport: validated.transport
+        )
+        #expect(exists)
+        #expect(!missing)
+        #expect(!wrongCWD)
+
+        let report = await validated.transport.stop(gracePeriod: .milliseconds(50))
+        #expect(report?.survivors.isEmpty == true)
+    }
+
+    @Test("Persisted-session lookup rejects a repeated pagination cursor")
+    func repeatedSessionListCursor() async throws {
+        let adapter = VibeAdapter()
+        let validated = try await adapter.launchValidatedAuthenticationProcess(
+            executable: try fakeVibeExecutable(),
+            workingDirectory: repositoryURL,
+            processOptions: try fakeProcessOptions(scenario: "session-list-cursor-loop")
+        )
+
+        await #expect(throws: VibeAdapterError.invalidSessionListPagination("same-cursor")) {
+            _ = try await adapter.persistedSessionExists(
+                sessionID: "missing-session",
+                cwd: repositoryURL,
+                transport: validated.transport
+            )
+        }
+        _ = await validated.transport.stop(gracePeriod: .milliseconds(50))
+    }
+
+    @Test("Persisted-session lookup rejects pagination beyond its finite page limit")
+    func sessionListPageLimit() async throws {
+        let adapter = VibeAdapter()
+        let validated = try await adapter.launchValidatedAuthenticationProcess(
+            executable: try fakeVibeExecutable(),
+            workingDirectory: repositoryURL,
+            processOptions: try fakeProcessOptions(scenario: "session-list-unique-cursors")
+        )
+
+        await #expect(throws: VibeAdapterError.sessionListPageLimitExceeded(
+            maximumPages: VibeAdapter.maximumSessionListPages
+        )) {
+            _ = try await adapter.persistedSessionExists(
+                sessionID: "missing-session",
+                cwd: repositoryURL,
+                transport: validated.transport
+            )
+        }
+        _ = await validated.transport.stop(gracePeriod: .milliseconds(50))
+    }
+
+    @Test("Only Vibe's exact requested-ID missing-session response is specialized")
+    func exactMissingSessionMapping() async throws {
+        let adapter = VibeAdapter()
+        let requestedID = "missing-session"
+        let exact = try await adapter.launchValidatedAuthenticationProcess(
+            executable: try fakeVibeExecutable(),
+            workingDirectory: repositoryURL,
+            processOptions: try fakeProcessOptions(scenario: "session-not-found")
+        )
+        await #expect(throws: VibeAdapterError.savedSessionUnavailable(requestedID)) {
+            _ = try await adapter.loadSession(
+                sessionID: requestedID,
+                cwd: repositoryURL,
+                transport: exact.transport
+            )
+        }
+        _ = await exact.transport.stop(gracePeriod: .milliseconds(50))
+
+        for scenario in [
+            "session-not-found-wrong-data",
+            "session-not-found-extra-data",
+            "session-not-found-wrong-message",
+        ] {
+            let mismatched = try await adapter.launchValidatedAuthenticationProcess(
+                executable: try fakeVibeExecutable(),
+                workingDirectory: repositoryURL,
+                processOptions: try fakeProcessOptions(scenario: scenario)
+            )
+            do {
+                _ = try await adapter.loadSession(
+                    sessionID: requestedID,
+                    cwd: repositoryURL,
+                    transport: mismatched.transport
+                )
+                Issue.record("Expected \(scenario) to remain a generic ACP failure")
+            } catch is VibeAdapterError {
+                Issue.record("Expected \(scenario) to remain a generic ACP failure")
+            } catch let error as ACPTransportError {
+                guard case .responseError = error else {
+                    Issue.record("Expected responseError for \(scenario), got \(error)")
+                    _ = await mismatched.transport.stop(gracePeriod: .milliseconds(50))
+                    continue
+                }
+            }
+            _ = await mismatched.transport.stop(gracePeriod: .milliseconds(50))
+        }
+    }
+
     @Test("Repository trust decoding preserves Vibe options and tolerates future status values")
     func tolerantRepositoryTrustStatus() async throws {
         let adapter = VibeAdapter()
@@ -121,6 +262,7 @@ struct VibeAdapterTests {
         #expect(status.reportedState == "untrusted")
         #expect(status.options == [.string("trust_repo"), .string("decline")])
         #expect(status.details?["futureField"]?.boolValue == true)
+        #expect(!status.allowsSessionStart)
         let trusted = try await withTimeout {
             try await adapter.applyRepositoryTrustDecision(
                 cwd: repositoryURL,
@@ -129,6 +271,7 @@ struct VibeAdapterTests {
             )
         }
         #expect(trusted.state == .trusted)
+        #expect(trusted.allowsSessionStart)
         #expect(try await adapter.repositoryTrustStatus(
             cwd: repositoryURL,
             transport: validated.transport
@@ -140,12 +283,27 @@ struct VibeAdapterTests {
             "futureField": .integer(1),
         ]))
         #expect(sessionTrusted.state == .trusted)
+        #expect(sessionTrusted.allowsSessionStart)
+        let noDecisionNeeded = VibeRepositoryTrustStatus(raw: .object([
+            "trust_status": .string("untrusted"),
+            "details": .null,
+        ]))
+        #expect(noDecisionNeeded.state == .untrusted)
+        #expect(noDecisionNeeded.allowsSessionStart)
+        #expect(!VibeRepositoryTrustStatus(raw: .object([
+            "trust_status": .string("untrusted"),
+        ])).allowsSessionStart)
+        #expect(!VibeRepositoryTrustStatus(raw: .object([
+            "trust_status": .string("untrusted"),
+            "details": .array([]),
+        ])).allowsSessionStart)
         let future = VibeRepositoryTrustStatus(raw: .object([
             "trust_status": .string("future_trust_state"),
             "options": .array([.object(["id": .string("future")])]),
         ]))
         #expect(future.state == .unknown(rawValue: "future_trust_state"))
         #expect(future.options == [.object(["id": .string("future")])])
+        #expect(!future.allowsSessionStart)
         #expect(VibeRepositoryTrustStatus(raw: .string("future-shape")).state == .unknown(rawValue: nil))
     }
 

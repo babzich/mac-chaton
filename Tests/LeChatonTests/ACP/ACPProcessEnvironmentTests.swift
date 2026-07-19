@@ -3,6 +3,24 @@ import Testing
 
 @Suite("ACP process environment")
 struct ACPProcessEnvironmentTests {
+    @Test("Provider secrets are injected only after sanitizing inherited credentials")
+    func providerSecretInjection() {
+        let environment = ACPProcessEnvironment.sanitized(
+            inheriting: [
+                "HOME": "/Users/tester",
+                "PATH": "/usr/bin:/bin",
+                "UNRELATED_API_KEY": "must-not-survive",
+                "MISTRAL_API_KEY": "must-not-survive",
+            ],
+            injecting: .init(name: "LECHATON_PROVIDER_TEST_KEY", secret: "provider-secret")
+        )
+
+        #expect(environment["LECHATON_PROVIDER_TEST_KEY"] == "provider-secret")
+        #expect(environment["UNRELATED_API_KEY"] == nil)
+        #expect(environment["MISTRAL_API_KEY"] == nil)
+        #expect(environment["HOME"] == "/Users/tester")
+    }
+
     @Test("Required Vibe runtime and corporate-network values are inherited")
     func inheritsRequiredValues() {
         let source = [
