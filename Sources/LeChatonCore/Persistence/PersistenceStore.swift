@@ -46,9 +46,11 @@ public actor PersistenceStore {
 
     private let clock: @Sendable () -> Date
     private let makeUUID: @Sendable () -> UUID
-    private let repositoryValidator: RepositoryValidator
+    private let validateRepository: @Sendable (URL) async throws -> CanonicalRepository
     private let fileOperations: any PersistenceFileOperating
     private var databasePool: DatabasePool?
+    private var repositoryValidationOperations: [UUID: Task<CanonicalRepository, any Error>] = [:]
+    private var isClosing = false
 
     public init(
         applicationSupportRoot: URL? = nil,
@@ -64,7 +66,7 @@ public actor PersistenceStore {
         locations = resolvedLocations
         self.clock = clock
         makeUUID = { UUID() }
-        repositoryValidator = RepositoryValidator()
+        validateRepository = { try await RepositoryValidator().validate($0) }
         fileOperations = operations
         databasePool = try Self.openDatabase(
             at: resolvedLocations,
@@ -76,13 +78,15 @@ public actor PersistenceStore {
         locations: PersistenceLocations,
         clock: @escaping @Sendable () -> Date,
         makeUUID: @escaping @Sendable () -> UUID,
-        repositoryValidator: RepositoryValidator = RepositoryValidator(),
+        validateRepository: @escaping @Sendable (URL) async throws -> CanonicalRepository = {
+            try await RepositoryValidator().validate($0)
+        },
         fileOperations: any PersistenceFileOperating = LocalPersistenceFileOperations()
     ) throws {
         self.locations = locations
         self.clock = clock
         self.makeUUID = makeUUID
-        self.repositoryValidator = repositoryValidator
+        self.validateRepository = validateRepository
         self.fileOperations = fileOperations
         databasePool = try Self.openDatabase(at: locations, fileOperations: fileOperations)
     }
@@ -131,7 +135,7 @@ public actor PersistenceStore {
             throw PersistenceStoreError.recoveryNotPermitted(.healthyStore)
         } catch let error as PersistenceStoreError {
             switch error {
-            case .corruptDatabase, .migrationFailed:
+            case .corruptDatabase, .migrationFailed, .invalidStoredMetadata:
                 break
             case .schemaTooNew, .recoveryNotPermitted:
                 throw error
@@ -182,9 +186,9 @@ public actor PersistenceStore {
         try read { db in try Self.fetchSnapshot(db) }
     }
 
-    public func createThread(_ request: CreateThreadRequest) throws -> SavedThreadMetadata {
+    public func createThread(_ request: CreateThreadRequest) async throws -> SavedThreadMetadata {
         try Self.validate(request)
-        let repository = try repositoryValidator.validate(request.repositoryURL)
+        let repository = try await validatedRepository(request.repositoryURL)
         let timestamp = Self.milliseconds(clock())
 
         return try write { db in
@@ -218,9 +222,9 @@ public actor PersistenceStore {
     public func replaceSelectedThread(
         expectedSelectedThreadID: UUID,
         with request: CreateThreadRequest
-    ) throws -> SavedThreadMetadata {
+    ) async throws -> SavedThreadMetadata {
         try Self.validate(request)
-        let repository = try repositoryValidator.validate(request.repositoryURL)
+        let repository = try await validatedRepository(request.repositoryURL)
         let timestamp = Self.milliseconds(clock())
 
         return try write { db in
@@ -310,7 +314,9 @@ public actor PersistenceStore {
         }
     }
 
-    public func close() throws {
+    public func close() async throws {
+        await stopRepositoryValidationOperations()
+
         guard let databasePool else { return }
         do {
             try databasePool.close()
@@ -321,7 +327,8 @@ public actor PersistenceStore {
     }
 
     /// Call only after session, authentication, and candidate runtime owners are stopped.
-    public func resetLocalMetadata() throws -> PersistenceResetResult {
+    public func resetLocalMetadata() async throws -> PersistenceResetResult {
+        await stopRepositoryValidationOperations()
         guard let databasePool else { throw PersistenceStoreError.storeClosed }
         do {
             try databasePool.close()
@@ -348,8 +355,9 @@ public actor PersistenceStore {
             )
         }
         do {
-            let snapshot = try replacement.read { db in try Self.fetchSnapshot(db) }
+            let snapshot = try await replacement.read { db in try Self.fetchSnapshot(db) }
             self.databasePool = replacement
+            isClosing = false
             return PersistenceResetResult(
                 backupDirectory: backupDirectory,
                 restoredSnapshot: snapshot
@@ -384,17 +392,43 @@ public actor PersistenceStore {
     }
 
     private func read<T>(_ body: (Database) throws -> T) throws -> T {
-        guard let databasePool else { throw PersistenceStoreError.storeClosed }
+        guard !isClosing, let databasePool else { throw PersistenceStoreError.storeClosed }
         do { return try databasePool.read(body) }
         catch let error as PersistenceStoreError { throw error }
         catch { throw Self.classifyDatabaseError(error) }
     }
 
     private func write<T>(_ body: (Database) throws -> T) throws -> T {
-        guard let databasePool else { throw PersistenceStoreError.storeClosed }
+        guard !isClosing, let databasePool else { throw PersistenceStoreError.storeClosed }
         do { return try databasePool.write(body) }
         catch let error as PersistenceStoreError { throw error }
         catch { throw Self.classifyDatabaseError(error) }
+    }
+
+    private func validatedRepository(_ url: URL) async throws -> CanonicalRepository {
+        guard !isClosing, databasePool != nil else { throw PersistenceStoreError.storeClosed }
+
+        let id = UUID()
+        let validateRepository = self.validateRepository
+        let operation = Task { try await validateRepository(url) }
+        repositoryValidationOperations[id] = operation
+        defer { repositoryValidationOperations.removeValue(forKey: id) }
+
+        let repository = try await withTaskCancellationHandler {
+            try await operation.value
+        } onCancel: {
+            operation.cancel()
+        }
+        guard !isClosing, databasePool != nil else { throw PersistenceStoreError.storeClosed }
+        return repository
+    }
+
+    private func stopRepositoryValidationOperations() async {
+        isClosing = true
+        let validations = Array(repositoryValidationOperations.values)
+        for validation in validations { validation.cancel() }
+        for validation in validations { _ = await validation.result }
+        repositoryValidationOperations.removeAll()
     }
 
     private static func openDatabase(
@@ -453,7 +487,6 @@ public actor PersistenceStore {
 
         do {
             try migrator.migrate(pool)
-            return pool
         } catch {
             try? pool.close()
             if let error = error as? DatabaseError,
@@ -461,6 +494,20 @@ public actor PersistenceStore {
                 throw PersistenceStoreError.corruptDatabase(error.message ?? "SQLite corruption")
             }
             throw PersistenceStoreError.migrationFailed(String(describing: error))
+        }
+
+        // A quick_check-clean SQLite file can still violate LeChaton's relational
+        // metadata contract. Validate the selected snapshot before publishing a
+        // store owner so startup can route semantic damage through recovery.
+        do {
+            _ = try pool.read { db in try fetchSnapshot(db) }
+            return pool
+        } catch let error as PersistenceStoreError {
+            try? pool.close()
+            throw error
+        } catch {
+            try? pool.close()
+            throw classifyDatabaseError(error)
         }
     }
 
@@ -581,9 +628,17 @@ public actor PersistenceStore {
             throw PersistenceStoreError.invalidStoredMetadata("unsupported execution mode \(executionModeString)")
         }
 
+        let canonicalPath: String = row["canonical_path"]
+        let environmentCWD: String = row["cwd"]
+        guard environmentCWD == canonicalPath else {
+            throw PersistenceStoreError.invalidStoredMetadata(
+                "Thread environment cwd must equal its Project canonical path"
+            )
+        }
+
         let project = ProjectMetadata(
             id: projectID,
-            canonicalPath: row["canonical_path"],
+            canonicalPath: canonicalPath,
             displayName: row["display_name"],
             createdAt: date(row, column: "project_created_at_ms"),
             lastOpenedAt: date(row, column: "last_opened_at_ms")
@@ -598,7 +653,7 @@ public actor PersistenceStore {
         )
         let environment = ThreadEnvironmentMetadata(
             threadID: threadID,
-            cwd: row["cwd"],
+            cwd: environmentCWD,
             executionMode: executionMode
         )
         return SavedThreadMetadata(project: project, thread: thread, environment: environment)

@@ -11,6 +11,40 @@ final class WorkspaceController {
     let persistenceLocations: PersistenceLocations
 
     private(set) var transientError: String?
+    private(set) var isGitBaselineReady = false
+    @ObservationIgnored private var gitBaselineRequestID = UUID()
+    @ObservationIgnored private var shutdownInProgress = false
+
+    var canPrompt: Bool { !shutdownInProgress && model.canPrompt && isGitBaselineReady }
+
+    var canCreateThread: Bool {
+        guard model.selectedThread == nil else { return false }
+
+        switch model.issue?.kind {
+        case .database, .authenticationRequired, .trustRequired:
+            return false
+        default:
+            break
+        }
+
+        return switch model.lifecycle {
+        case .unloaded, .failed(_): true
+        default: false
+        }
+    }
+
+    var canReplaceThread: Bool {
+        guard model.selectedThread != nil else { return false }
+        return model.lifecycle == .unloaded || model.lifecycle == .idle
+    }
+
+    var canRemoveThread: Bool {
+        guard model.selectedThread != nil, !model.hasPendingCleanup else { return false }
+        return switch model.lifecycle {
+        case .unloaded, .idle, .reloadRequired, .failed(_): true
+        default: false
+        }
+    }
 
     init(
         model: SessionModel,
@@ -24,6 +58,7 @@ final class WorkspaceController {
 
     func resume() async {
         transientError = nil
+        invalidateGitBaseline()
         await model.resume()
         await recaptureGitBaselineIfLoaded()
     }
@@ -38,24 +73,43 @@ final class WorkspaceController {
 
     func resolveRepositoryTrust(decision: String) async {
         transientError = nil
+        invalidateGitBaseline()
         await model.resolveRepositoryTrust(decision: decision)
         await recaptureGitBaselineIfLoaded()
     }
 
+    func retryPendingRepositoryTrust() async {
+        transientError = nil
+        invalidateGitBaseline()
+        await model.retryPendingRepositoryTrust()
+        await recaptureGitBaselineIfLoaded()
+    }
+
+    func cancelPendingRepositoryTrust() {
+        transientError = nil
+        model.cancelPendingRepositoryTrust()
+    }
+
     func createThread(repositoryURL: URL, title: String) async {
         transientError = nil
+        invalidateGitBaseline()
         await model.createThread(repositoryURL: repositoryURL, title: title)
         await recaptureGitBaselineIfLoaded()
     }
 
     func replaceThread(repositoryURL: URL, title: String) async {
         transientError = nil
+        invalidateGitBaseline()
         await model.replaceSavedThread(repositoryURL: repositoryURL, title: title)
         await recaptureGitBaselineIfLoaded()
     }
 
     func sendPrompt(_ text: String) async {
         transientError = nil
+        guard canPrompt else {
+            transientError = "Capture the repository baseline before prompting. Use Retry Baseline or open Repository Changes."
+            return
+        }
         do {
             _ = try await model.sendPrompt(text)
         } catch {
@@ -80,28 +134,74 @@ final class WorkspaceController {
     }
 
     func unload() async {
+        invalidateGitBaseline()
         await model.unload()
-        git.clear()
     }
 
     func resetRuntime() async {
+        invalidateGitBaseline()
         await model.resetRuntime()
-        git.clear()
+    }
+
+    func retryCleanup() async {
+        transientError = nil
+        await model.retryCleanup()
+    }
+
+    func retryExecutableCandidate() async {
+        transientError = nil
+        await model.retryExecutableCandidate()
     }
 
     func removeSavedThread() async {
+        invalidateGitBaseline()
         await model.removeSavedThread()
-        if model.selectedThread == nil { git.clear() }
     }
 
     func refreshGit() async {
-        guard let repositoryURL else { return }
-        await git.refresh(repository: repositoryURL)
+        guard !shutdownInProgress, let repositoryURL else { return }
+        let requestID = UUID()
+        gitBaselineRequestID = requestID
+        let repositoryPath = repositoryURL.standardizedFileURL.path
+        let ready = await git.refresh(repository: repositoryURL)
+        guard gitBaselineRequestID == requestID,
+              model.lifecycle == .idle,
+              self.repositoryURL?.standardizedFileURL.path == repositoryPath
+        else { return }
+        isGitBaselineReady = ready
     }
 
     func validateExecutable(_ url: URL) async {
         transientError = nil
         await model.validateExecutableCandidate(url)
+    }
+
+    func refreshCurrentAuthentication() async {
+        transientError = nil
+        do {
+            try await model.refreshCurrentAuthentication()
+        } catch {
+            transientError = String(describing: error)
+        }
+    }
+
+    func startCurrentAuthentication() async {
+        transientError = nil
+        do {
+            let url = try await model.startCurrentAuthentication()
+            NSWorkspace.shared.open(url)
+        } catch {
+            transientError = String(describing: error)
+        }
+    }
+
+    func completeCurrentAuthentication(attemptID: String) async {
+        transientError = nil
+        do {
+            try await model.completeCurrentAuthentication(attemptID: attemptID)
+        } catch {
+            transientError = String(describing: error)
+        }
     }
 
     func startCandidateAuthentication() async {
@@ -128,13 +228,12 @@ final class WorkspaceController {
     }
 
     func commitExecutableCandidate() async {
+        invalidateGitBaseline()
         await model.commitExecutableCandidate()
-        if model.lifecycle == .unloaded { git.clear() }
     }
 
     func applyConfiguration(optionID: String, value: JSONValue) async {
         await model.applyConfiguration(optionID: optionID, value: value)
-        await recaptureGitBaselineIfLoaded()
     }
 
     func revealDatabase() {
@@ -174,8 +273,18 @@ final class WorkspaceController {
         transientError = nil
     }
 
-    func shutdown() async {
-        await model.shutdown()
+    @discardableResult
+    func shutdown() async -> Bool {
+        shutdownInProgress = true
+        invalidateGitBaseline()
+        await git.prepareForShutdown()
+
+        let canTerminate = await model.shutdown()
+        if !canTerminate {
+            shutdownInProgress = false
+            git.resumeAfterFailedShutdown()
+        }
+        return canTerminate
     }
 
     private var repositoryURL: URL? {
@@ -185,61 +294,22 @@ final class WorkspaceController {
     }
 
     private func recaptureGitBaselineIfLoaded() async {
-        guard model.lifecycle == .idle, let repositoryURL else { return }
-        await git.captureBaseline(repository: repositoryURL)
-    }
-}
-
-@MainActor
-@Observable
-final class GitInspectionController {
-    private(set) var baseline: GitStatusSnapshot?
-    private(set) var inspection: GitInspection?
-    private(set) var isLoading = false
-    private(set) var errorMessage: String?
-
-    @ObservationIgnored private let inspector: GitInspector
-
-    init(inspector: GitInspector) {
-        self.inspector = inspector
+        isGitBaselineReady = false
+        guard !shutdownInProgress, model.lifecycle == .idle, let repositoryURL else { return }
+        let requestID = UUID()
+        gitBaselineRequestID = requestID
+        let repositoryPath = repositoryURL.standardizedFileURL.path
+        let ready = await git.captureBaseline(repository: repositoryURL)
+        guard gitBaselineRequestID == requestID,
+              model.lifecycle == .idle,
+              self.repositoryURL?.standardizedFileURL.path == repositoryPath
+        else { return }
+        isGitBaselineReady = ready
     }
 
-    func captureBaseline(repository: URL) async {
-        isLoading = true
-        errorMessage = nil
-        inspection = nil
-        do {
-            baseline = try await inspector.captureBaseline(repository: repository)
-        } catch {
-            baseline = nil
-            errorMessage = String(describing: error)
-        }
-        isLoading = false
-    }
-
-    func refresh(repository: URL) async {
-        isLoading = true
-        errorMessage = nil
-        do {
-            let baseline: GitStatusSnapshot
-            if let existing = self.baseline {
-                baseline = existing
-            } else {
-                baseline = try await inspector.captureBaseline(repository: repository)
-                self.baseline = baseline
-            }
-            inspection = try await inspector.inspect(repository: repository, baseline: baseline)
-        } catch {
-            inspection = nil
-            errorMessage = String(describing: error)
-        }
-        isLoading = false
-    }
-
-    func clear() {
-        baseline = nil
-        inspection = nil
-        errorMessage = nil
-        isLoading = false
+    private func invalidateGitBaseline() {
+        gitBaselineRequestID = UUID()
+        isGitBaselineReady = false
+        git.clear()
     }
 }

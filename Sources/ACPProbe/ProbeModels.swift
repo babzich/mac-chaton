@@ -133,60 +133,17 @@ struct SanitizedBarrierRecord: Encodable, Sendable {
     let acknowledged: Bool
 }
 
-struct ConfigurationOption: Equatable, Sendable {
-    let id: String
-    let currentValue: JSONValue
-    let values: [JSONValue]
-    let type: String
-
-    init?(_ raw: JSONValue) {
-        guard
-            let object = raw.objectValue,
-            let id = object["id"]?.stringValue,
-            !id.isEmpty,
-            let currentValue = object["currentValue"],
-            let type = object["type"]?.stringValue
-        else { return nil }
-
-        let values: [JSONValue]
-        if type == "select" {
-            guard let choices = object["options"]?.arrayValue else { return nil }
-            values = choices.compactMap { $0.objectValue?["value"] }
-        } else if type == "boolean" {
-            values = [.bool(false), .bool(true)]
-        } else {
-            return nil
-        }
-        self.id = id
-        self.currentValue = currentValue
-        self.values = values
-        self.type = type
-    }
-
-    var alternateValue: JSONValue? { values.first(where: { $0 != currentValue }) }
-}
-
-struct ConfigurationJournal: Codable, Sendable {
-    struct OriginalValue: Codable, Sendable {
-        let optionID: String
-        let value: JSONValue
-    }
-
-    let formatVersion: Int
-    let executablePath: String
-    let workingDirectory: String
-    let sessionID: String
-    let createdAtUnixMilliseconds: Int64
-    let model: OriginalValue
-    let thinking: OriginalValue
-}
-
 struct ConfigurationSnapshot: Sendable {
-    let options: [ConfigurationOption]
+    let options: [VibeConfigurationOption]
 
-    func option(id: String) throws -> ConfigurationOption {
+    func option(id: String) throws -> VibeConfigurationOption {
         guard let option = options.first(where: { $0.id == id }) else {
             throw ProbeError.compatibility("configuration option \(id) was not advertised")
+        }
+        guard option.kind == .select || option.kind == .boolean else {
+            throw ProbeError.compatibility(
+                "configuration option \(id) has unsupported type \(option.kind.rawValue)"
+            )
         }
         return option
     }

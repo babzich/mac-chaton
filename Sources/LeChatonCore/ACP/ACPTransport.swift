@@ -7,19 +7,40 @@ public struct ACPTransportConfiguration: Equatable, Sendable {
     public let workingDirectory: URL
     public let environment: [String: String]
     public let maximumFrameBytes: Int
+    public let maximumPendingOutgoingFrames: Int
+    public let maximumPendingOutgoingBytes: Int
+    public let standardInputWriteTimeout: Duration
+    public let responseTimeout: Duration
+    public let promptResponseTimeout: Duration
 
     public init(
         executableURL: URL,
         arguments: [String] = [],
         workingDirectory: URL,
         environment: [String: String]? = nil,
-        maximumFrameBytes: Int = 16 * 1_024 * 1_024
+        maximumFrameBytes: Int = 16 * 1_024 * 1_024,
+        maximumPendingOutgoingFrames: Int = 64,
+        maximumPendingOutgoingBytes: Int = 32 * 1_024 * 1_024,
+        standardInputWriteTimeout: Duration = .seconds(5),
+        responseTimeout: Duration = .seconds(60),
+        promptResponseTimeout: Duration = .seconds(600)
     ) {
+        precondition(maximumFrameBytes > 0)
+        precondition(maximumPendingOutgoingFrames > 0)
+        precondition(maximumPendingOutgoingBytes > 0)
+        precondition(standardInputWriteTimeout > .zero)
+        precondition(responseTimeout > .zero)
+        precondition(promptResponseTimeout > .zero)
         self.executableURL = executableURL
         self.arguments = arguments
         self.workingDirectory = workingDirectory
         self.environment = environment ?? ACPProcessEnvironment.sanitized()
         self.maximumFrameBytes = maximumFrameBytes
+        self.maximumPendingOutgoingFrames = maximumPendingOutgoingFrames
+        self.maximumPendingOutgoingBytes = maximumPendingOutgoingBytes
+        self.standardInputWriteTimeout = standardInputWriteTimeout
+        self.responseTimeout = responseTimeout
+        self.promptResponseTimeout = promptResponseTimeout
     }
 }
 
@@ -29,6 +50,10 @@ public enum ACPTransportError: Error, Equatable, Sendable, CustomStringConvertib
     case stopped
     case launchFailed(String)
     case writeFailed(String)
+    case outgoingFrameTooLarge(maximumBytes: Int)
+    case outgoingQueueFull(maximumFrames: Int, maximumBytes: Int)
+    case writeTimedOut
+    case responseTimedOut(method: String)
     case protocolViolation(String)
     case unsupportedProtocolVersion(expected: Int, reported: Int)
     case responseError(JSONRPCErrorObject)
@@ -46,6 +71,12 @@ public enum ACPTransportError: Error, Equatable, Sendable, CustomStringConvertib
         case .stopped: "ACP transport is stopped"
         case let .launchFailed(reason): "Could not launch ACP process: \(reason)"
         case let .writeFailed(reason): "Could not write ACP frame: \(reason)"
+        case let .outgoingFrameTooLarge(maximumBytes):
+            "ACP outgoing frame exceeded \(maximumBytes) bytes"
+        case let .outgoingQueueFull(maximumFrames, maximumBytes):
+            "ACP outgoing queue exceeded \(maximumFrames) frames or \(maximumBytes) bytes"
+        case .writeTimedOut: "Timed out writing an ACP frame"
+        case let .responseTimedOut(method): "Timed out waiting for ACP response to \(method)"
         case let .protocolViolation(reason): "ACP protocol violation: \(reason)"
         case let .unsupportedProtocolVersion(expected, reported):
             "Unsupported ACP protocol: expected \(expected), reported \(reported)"
@@ -152,9 +183,12 @@ public struct PermissionRequest: Equatable, Hashable, Sendable {
             request.method == "session/request_permission",
             let object = request.params?.objectValue,
             let sessionID = object["sessionId"]?.stringValue,
+            !sessionID.isEmpty,
             let tool = object["toolCall"]?.objectValue,
             let toolCallID = tool["toolCallId"]?.stringValue,
-            let rawOptions = object["options"]?.arrayValue
+            !toolCallID.isEmpty,
+            let rawOptions = object["options"]?.arrayValue,
+            !rawOptions.isEmpty
         else { return nil }
 
         var decoded: [PermissionOption] = []
@@ -162,8 +196,11 @@ public struct PermissionRequest: Equatable, Hashable, Sendable {
             guard
                 let option = rawOption.objectValue,
                 let optionID = option["optionId"]?.stringValue,
+                !optionID.isEmpty,
                 let name = option["name"]?.stringValue,
-                let kind = option["kind"]?.stringValue
+                !name.isEmpty,
+                let kind = option["kind"]?.stringValue,
+                !kind.isEmpty
             else { return nil }
             decoded.append(.init(optionID: optionID, name: name, kind: kind, metadata: option["_meta"]))
         }
@@ -193,6 +230,8 @@ private struct ResponseFrame: Sendable {
 private struct PendingRequest {
     let method: String
     let continuation: CheckedContinuation<ResponseFrame, any Error>
+    let writeID: UUID
+    var deadlineTask: Task<Void, Never>?
 }
 
 private enum CancellationPhase: Equatable {
@@ -203,6 +242,10 @@ private enum CancellationPhase: Equatable {
 
 /// Owns exactly one ACP process generation and all of its protocol continuations.
 public actor ACPTransport {
+    private static let cancelledPermissionResult: JSONValue = .object([
+        "outcome": .object(["outcome": .string("cancelled")]),
+    ])
+
     public let configuration: ACPTransportConfiguration
 
     private let updateStream: AsyncStream<EventEnvelope<SessionUpdate>>
@@ -217,6 +260,8 @@ public actor ACPTransport {
     private var receiveTask: Task<Void, Never>?
     private var standardErrorTask: Task<Void, Never>?
     private var waitTask: Task<Void, Never>?
+    private var writerEventTask: Task<Void, Never>?
+    private var standardInputWriter: ACPStandardInputWriter?
     private var inputBuffer = Data()
     private var nextRequestID: Int64 = 1
     private var pendingResponses: [RPCID: PendingRequest] = [:]
@@ -271,10 +316,25 @@ public actor ACPTransport {
             throw ACPTransportError.launchFailed(String(describing: error))
         }
 
+        let writer: ACPStandardInputWriter
+        do {
+            writer = try ACPStandardInputWriter(
+                fileDescriptor: spawned.standardInput.fileDescriptor,
+                maximumFrameBytes: configuration.maximumFrameBytes,
+                maximumPendingFrames: configuration.maximumPendingOutgoingFrames,
+                maximumPendingBytes: configuration.maximumPendingOutgoingBytes
+            )
+        } catch {
+            abortSpawnedProcess(spawned)
+            throw ACPTransportError.launchFailed(String(describing: error))
+        }
+
         let newGeneration = UUID()
         process = spawned
+        standardInputWriter = writer
         generation = newGeneration
         terminator = ProcessTreeTerminator(root: spawned.identity)
+        startWriterEvents(writer)
         startReaders(for: spawned)
         return newGeneration
     }
@@ -443,7 +503,8 @@ public actor ACPTransport {
             params: .object([
                 "sessionId": .string(sessionID),
                 "prompt": .array([.object(["type": .string("text"), "text": .string(text)])]),
-            ])
+            ]),
+            responseTimeout: configuration.promptResponseTimeout
         )
         guard
             let object = result.objectValue,
@@ -485,8 +546,9 @@ public actor ACPTransport {
 
         cancellationPhase = .sent(sessionID: sessionID)
         do {
-            // No suspension is allowed between the completed snapshot and this write.
-            try write(JSONRPCMessage.notification(
+            // Queue acceptance is synchronous and nonblocking, so no actor suspension occurs
+            // between the verified snapshot and the one ordered cancellation notification.
+            _ = try enqueueFrame(JSONRPCMessage.notification(
                 method: "session/cancel",
                 params: .object(["sessionId": .string(sessionID)])
             ))
@@ -495,7 +557,7 @@ public actor ACPTransport {
                 .filter { $0.method == "session/request_permission" }
                 .map(\.id)
             for id in permissionIDs {
-                try respondWithCancellation(id: id)
+                try enqueueCancellationResponse(id: id)
             }
         } catch {
             let failure = error as? ACPTransportError ?? .writeFailed(String(describing: error))
@@ -539,23 +601,24 @@ public actor ACPTransport {
     }
 
     public func respond(id: RPCID, result: JSONValue) throws {
-        if cancellationPhase != .none {
-            try respondWithCancellation(id: id)
-            return
-        }
-        try respondOnce(id: id, result: result)
+        try respondOnce(
+            id: id,
+            result: cancellationPhase == .none ? result : Self.cancelledPermissionResult
+        )
     }
 
     private func respondOnce(id: RPCID, result: JSONValue) throws {
-        guard unresolvedIncoming.removeValue(forKey: id) != nil else { return }
-        try write(JSONRPCMessage.response(id: id, result: result))
+        guard unresolvedIncoming[id] != nil else { return }
+
+        // Queue admission is the exactly-once commit edge. Keeping the request
+        // unresolved until this synchronous operation succeeds makes a bounded
+        // admission failure retryable without allowing cancellation or another
+        // decision to enqueue a second response for the same JSON-RPC ID.
+        _ = try enqueueFrame(JSONRPCMessage.response(id: id, result: result))
+        unresolvedIncoming.removeValue(forKey: id)
     }
 
     public func respondToPermission(id: RPCID, selectedOptionID: String) throws {
-        if cancellationPhase != .none {
-            try respondWithCancellation(id: id)
-            return
-        }
         try respond(id: id, result: .object([
             "outcome": .object([
                 "outcome": .string("selected"),
@@ -564,18 +627,28 @@ public actor ACPTransport {
         ]))
     }
 
-    private func respondWithCancellation(id: RPCID) throws {
-        try respondOnce(id: id, result: .object([
-            "outcome": .object(["outcome": .string("cancelled")]),
-        ]))
+    public func respondToPermissionCancellation(id: RPCID) throws {
+        try respondOnce(id: id, result: Self.cancelledPermissionResult)
     }
 
-    public func request(method: String, params: JSONValue? = nil) async throws -> JSONValue {
-        try await requestFrame(method: method, params: params).result
+    private func enqueueCancellationResponse(id: RPCID) throws {
+        try respondOnce(id: id, result: Self.cancelledPermissionResult)
     }
 
-    public func sendNotification(method: String, params: JSONValue? = nil) throws {
-        try write(JSONRPCMessage.notification(method: method, params: params))
+    public func request(
+        method: String,
+        params: JSONValue? = nil,
+        responseTimeout: Duration? = nil
+    ) async throws -> JSONValue {
+        try await requestFrame(
+            method: method,
+            params: params,
+            responseTimeout: responseTimeout
+        ).result
+    }
+
+    public func sendNotification(method: String, params: JSONValue? = nil) async throws {
+        try await writeFrame(JSONRPCMessage.notification(method: method, params: params))
     }
 
     /// Starts/refreshes descendant tracking at the cancellation boundary.
@@ -611,8 +684,11 @@ public actor ACPTransport {
         guard !stopping else { return nil }
         stopping = true
         cancellationPhase = .none
+        let writer = standardInputWriter
+        writer?.initiateStop()
         failPending(with: .stopped)
         unresolvedIncoming.removeAll()
+        if let writer { await writer.waitUntilStopped() }
         try? process?.standardInput.close()
 
         cleanupInProgress = true
@@ -621,27 +697,50 @@ public actor ACPTransport {
         receiveTask?.cancel()
         standardErrorTask?.cancel()
         waitTask?.cancel()
+        writerEventTask?.cancel()
         try? process?.standardOutput.close()
         try? process?.standardError.close()
         finishStreams()
         process = nil
+        standardInputWriter = nil
         return report
     }
 
-    private func requestFrame(method: String, params: JSONValue?) async throws -> ResponseFrame {
+    private func requestFrame(
+        method: String,
+        params: JSONValue?,
+        responseTimeout: Duration? = nil
+    ) async throws -> ResponseFrame {
         guard process != nil, generation != nil else { throw ACPTransportError.notStarted }
         if let terminalFailure { throw terminalFailure }
         guard !stopping else { throw ACPTransportError.stopped }
 
         let id = RPCID.integer(nextRequestID)
         nextRequestID += 1
+        let timeout = responseTimeout ?? configuration.responseTimeout
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                pendingResponses[id] = PendingRequest(method: method, continuation: continuation)
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
                 do {
-                    try write(JSONRPCMessage.request(id: id, method: method, params: params))
+                    let writeID = try enqueueFrame(
+                        JSONRPCMessage.request(id: id, method: method, params: params)
+                    )
+                    let deadlineTask = Task { [weak self] in
+                        do {
+                            try await Task.sleep(for: timeout)
+                        } catch {
+                            return
+                        }
+                        guard !Task.isCancelled else { return }
+                        await self?.requestDeadlineExpired(id)
+                    }
+                    pendingResponses[id] = PendingRequest(
+                        method: method,
+                        continuation: continuation,
+                        writeID: writeID,
+                        deadlineTask: deadlineTask
+                    )
                 } catch {
-                    pendingResponses.removeValue(forKey: id)
                     continuation.resume(throwing: error)
                 }
             }
@@ -651,7 +750,33 @@ public actor ACPTransport {
     }
 
     private func cancelPendingRequest(_ id: RPCID) {
-        pendingResponses.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
+        guard let pending = pendingResponses.removeValue(forKey: id) else { return }
+        pending.deadlineTask?.cancel()
+        standardInputWriter?.cancel(id: pending.writeID)
+        pending.continuation.resume(throwing: CancellationError())
+    }
+
+    private func requestDeadlineExpired(_ id: RPCID) {
+        guard let pending = pendingResponses[id] else { return }
+        failTransport(.responseTimedOut(method: pending.method))
+    }
+
+    private func startWriterEvents(_ writer: ACPStandardInputWriter) {
+        let events = writer.events()
+        writerEventTask = Task.detached { [weak self] in
+            for await event in events {
+                await self?.receivedWriterEvent(event)
+            }
+        }
+    }
+
+    private func receivedWriterEvent(_ event: ACPStandardInputWriterEvent) {
+        switch event {
+        case let .wrote(bytes):
+            diagnosticContinuation.yield(.standardInput(bytes: bytes))
+        case let .failed(error):
+            failTransport(error)
+        }
     }
 
     private func startReaders(for spawned: SpawnedProcess) {
@@ -734,6 +859,7 @@ public actor ACPTransport {
                 diagnosticContinuation.yield(.ignoredResponse(id: response.id))
                 return
             }
+            pending.deadlineTask?.cancel()
             if pending.method == "session/prompt", cancellationPhase != .none {
                 cancellationPromptResponseReceived = true
             }
@@ -778,7 +904,7 @@ public actor ACPTransport {
 
         case let .request(request):
             guard request.method == "session/request_permission" else {
-                try write(JSONRPCMessage.errorResponse(
+                _ = try enqueueFrame(JSONRPCMessage.errorResponse(
                     id: request.id,
                     error: .init(code: -32601, message: "Method not found")
                 ))
@@ -791,7 +917,7 @@ public actor ACPTransport {
                 metadata: request.metadata
             )
             guard PermissionRequest(incoming) != nil else {
-                try write(JSONRPCMessage.errorResponse(
+                _ = try enqueueFrame(JSONRPCMessage.errorResponse(
                     id: request.id,
                     error: .init(code: -32602, message: "Invalid params")
                 ))
@@ -800,7 +926,7 @@ public actor ACPTransport {
             unresolvedIncoming[request.id] = incoming
             if cancellationPhase != .none {
                 if case .sent = cancellationPhase {
-                    try respondWithCancellation(id: request.id)
+                    try enqueueCancellationResponse(id: request.id)
                 }
                 return
             }
@@ -808,38 +934,52 @@ public actor ACPTransport {
         }
     }
 
-    private func write(_ value: JSONValue) throws {
-        guard let handle = process?.standardInput else { throw ACPTransportError.notStarted }
+    @discardableResult
+    private func enqueueFrame(_ value: JSONValue) throws -> UUID {
+        guard process != nil, let writer = standardInputWriter else {
+            throw ACPTransportError.notStarted
+        }
         if let terminalFailure { throw terminalFailure }
-        var data: Data
-        do { data = try value.encodedData() }
-        catch { throw ACPTransportError.writeFailed(String(describing: error)) }
-        data.append(0x0A)
+        guard !stopping else { throw ACPTransportError.stopped }
+        return try writer.enqueue(
+            encodedFrame(value),
+            timeout: configuration.standardInputWriteTimeout
+        )
+    }
+
+    private func writeFrame(_ value: JSONValue) async throws {
+        guard process != nil, let writer = standardInputWriter else {
+            throw ACPTransportError.notStarted
+        }
+        if let terminalFailure { throw terminalFailure }
+        guard !stopping else { throw ACPTransportError.stopped }
         do {
-            try data.withUnsafeBytes { rawBuffer in
-                guard let baseAddress = rawBuffer.baseAddress else { return }
-                var written = 0
-                while written < rawBuffer.count {
-                    let result = Darwin.write(
-                        handle.fileDescriptor,
-                        baseAddress.advanced(by: written),
-                        rawBuffer.count - written
-                    )
-                    if result > 0 {
-                        written += result
-                    } else if result == -1, errno == EINTR {
-                        continue
-                    } else {
-                        throw ACPTransportError.writeFailed(String(cString: strerror(errno)))
-                    }
-                }
-            }
-            diagnosticContinuation.yield(.standardInput(bytes: data.count))
+            try await writer.write(
+                encodedFrame(value),
+                timeout: configuration.standardInputWriteTimeout
+            )
         } catch let error as ACPTransportError {
+            switch error {
+            case .writeFailed, .writeTimedOut:
+                failTransport(error)
+            default:
+                break
+            }
             throw error
+        } catch {
+            throw error
+        }
+    }
+
+    private func encodedFrame(_ value: JSONValue) throws -> Data {
+        var data: Data
+        do {
+            data = try value.encodedData()
         } catch {
             throw ACPTransportError.writeFailed(String(describing: error))
         }
+        data.append(0x0A)
+        return data
     }
 
     private func receivedStandardError(byteCount: Int) {
@@ -871,21 +1011,30 @@ public actor ACPTransport {
         loadAttemptID = nil
         cancellationPhase = .none
         cancellationPromptResponseReceived = false
+        let writer = standardInputWriter
+        writer?.initiateStop()
         failPending(with: failure)
         unresolvedIncoming.removeAll()
         diagnosticContinuation.yield(.failure(failure))
         updateContinuation.finish()
         requestContinuation.finish()
-        try? process?.standardInput.close()
-        if let terminator, !cleanupInProgress {
-            Task { _ = await terminator.terminate() }
+        let standardInput = process?.standardInput
+        let terminator = cleanupInProgress ? nil : terminator
+        Task {
+            if let writer { await writer.waitUntilStopped() }
+            try? standardInput?.close()
+            if let terminator { _ = await terminator.terminate() }
         }
     }
 
     private func failPending(with error: ACPTransportError) {
         let pending = pendingResponses.values
         pendingResponses.removeAll()
-        for request in pending { request.continuation.resume(throwing: error) }
+        for request in pending {
+            request.deadlineTask?.cancel()
+            standardInputWriter?.cancel(id: request.writeID)
+            request.continuation.resume(throwing: error)
+        }
     }
 
     private func finishStreams() {
@@ -893,6 +1042,344 @@ public actor ACPTransport {
         requestContinuation.finish()
         diagnosticContinuation.finish()
     }
+}
+
+enum ACPStandardInputWriterEvent: Sendable {
+    case wrote(bytes: Int)
+    case failed(ACPTransportError)
+}
+
+private struct FrameWriteWasCancelled: Error, Sendable {
+    let wroteBytes: Int
+}
+
+/// A dedicated serial writer keeps POSIX backpressure off the transport actor.
+/// Enqueueing is synchronous and bounded, so cancellation can atomically queue
+/// its notification after the process-tree snapshot while actual writes happen
+/// on a detached worker against a nonblocking descriptor.
+final class ACPStandardInputWriter: @unchecked Sendable {
+    private struct Frame {
+        let id: UUID
+        let data: Data
+        let timeout: Duration
+        let completion: CheckedContinuation<Void, any Error>?
+    }
+
+    private final class CancellationFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            let value = cancelled
+            lock.unlock()
+            return value
+        }
+    }
+
+    private let fileDescriptor: Int32
+    private let maximumFrameBytes: Int
+    private let maximumPendingFrames: Int
+    private let maximumPendingBytes: Int
+    private let writeOperation: @Sendable (Data, Int32, Duration) throws -> Int
+    private let eventStream: AsyncStream<ACPStandardInputWriterEvent>
+    private let eventContinuation: AsyncStream<ACPStandardInputWriterEvent>.Continuation
+    private let lock = NSLock()
+
+    private var queue: [Frame] = []
+    private var active: Frame?
+    private var activeTask: Task<Void, Never>?
+    private var outstandingBytes = 0
+    private var stopped = false
+
+    init(
+        fileDescriptor: Int32,
+        maximumFrameBytes: Int,
+        maximumPendingFrames: Int,
+        maximumPendingBytes: Int,
+        writeOperation: @escaping @Sendable (Data, Int32, Duration) throws -> Int = {
+            try writeNonblockingFrame($0, fileDescriptor: $1, timeout: $2)
+        }
+    ) throws {
+        let flags = fcntl(fileDescriptor, F_GETFL)
+        guard flags != -1, fcntl(fileDescriptor, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            throw ACPTransportError.writeFailed(String(cString: strerror(errno)))
+        }
+        // Prevent a closed child pipe from terminating LeChaton with SIGPIPE.
+        _ = fcntl(fileDescriptor, F_SETNOSIGPIPE, 1)
+
+        self.fileDescriptor = fileDescriptor
+        self.maximumFrameBytes = maximumFrameBytes
+        self.maximumPendingFrames = maximumPendingFrames
+        self.maximumPendingBytes = maximumPendingBytes
+        self.writeOperation = writeOperation
+        (eventStream, eventContinuation) = AsyncStream.makeStream(
+            of: ACPStandardInputWriterEvent.self,
+            bufferingPolicy: .unbounded
+        )
+    }
+
+    func events() -> AsyncStream<ACPStandardInputWriterEvent> { eventStream }
+
+    @discardableResult
+    func enqueue(_ data: Data, timeout: Duration) throws -> UUID {
+        let id = UUID()
+        try enqueue(
+            Frame(id: id, data: data, timeout: timeout, completion: nil),
+            cancellationFlag: nil
+        )
+        return id
+    }
+
+    func write(_ data: Data, timeout: Duration) async throws {
+        let id = UUID()
+        let flag = CancellationFlag()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { continuation in
+                do {
+                    try enqueue(
+                        Frame(id: id, data: data, timeout: timeout, completion: continuation),
+                        cancellationFlag: flag
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        } onCancel: {
+            flag.cancel()
+            self.cancel(id: id)
+        }
+    }
+
+    func cancel(id: UUID) {
+        var continuation: CheckedContinuation<Void, any Error>?
+        lock.lock()
+        if let index = queue.firstIndex(where: { $0.id == id }) {
+            let frame = queue.remove(at: index)
+            outstandingBytes -= frame.data.count
+            continuation = frame.completion
+            startNextIfNeededLocked()
+        } else if active?.id == id {
+            activeTask?.cancel()
+        }
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    /// Synchronously prevents further admission and cancels the active worker.
+    /// Call `waitUntilStopped()` before closing the owned descriptor.
+    func initiateStop() {
+        var continuations: [CheckedContinuation<Void, any Error>] = []
+        lock.lock()
+        guard !stopped else {
+            lock.unlock()
+            return
+        }
+        stopped = true
+        activeTask?.cancel()
+        if let completion = active?.completion { continuations.append(completion) }
+        continuations.append(contentsOf: queue.compactMap(\.completion))
+        active = nil
+        queue.removeAll()
+        outstandingBytes = 0
+        lock.unlock()
+
+        for continuation in continuations {
+            continuation.resume(throwing: ACPTransportError.stopped)
+        }
+        eventContinuation.finish()
+    }
+
+    /// Joins the detached worker so its final descriptor access happens before
+    /// the transport closes (and the OS can reuse) that descriptor.
+    func waitUntilStopped() async {
+        let task = activeTaskSnapshot()
+        await task?.value
+        clearCompletedActiveTask()
+    }
+
+    func stop() async {
+        initiateStop()
+        await waitUntilStopped()
+    }
+
+    private func enqueue(_ frame: Frame, cancellationFlag: CancellationFlag?) throws {
+        guard frame.data.count <= maximumFrameBytes else {
+            throw ACPTransportError.outgoingFrameTooLarge(maximumBytes: maximumFrameBytes)
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { throw ACPTransportError.stopped }
+        if cancellationFlag?.isCancelled == true { throw CancellationError() }
+        let outstandingFrames = queue.count + (active == nil ? 0 : 1)
+        guard
+            frame.data.count <= maximumPendingBytes,
+            outstandingFrames < maximumPendingFrames,
+            outstandingBytes <= maximumPendingBytes - frame.data.count
+        else {
+            throw ACPTransportError.outgoingQueueFull(
+                maximumFrames: maximumPendingFrames,
+                maximumBytes: maximumPendingBytes
+            )
+        }
+        queue.append(frame)
+        outstandingBytes += frame.data.count
+        startNextIfNeededLocked()
+    }
+
+    private func startNextIfNeededLocked() {
+        guard !stopped, active == nil, !queue.isEmpty else { return }
+        let frame = queue.removeFirst()
+        active = frame
+        let descriptor = fileDescriptor
+        let writeOperation = writeOperation
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            let result: Result<Int, any Error>
+            do {
+                result = .success(try writeOperation(frame.data, descriptor, frame.timeout))
+            } catch {
+                result = .failure(error)
+            }
+            self?.finished(id: frame.id, result: result)
+        }
+        activeTask = task
+    }
+
+    private func activeTaskSnapshot() -> Task<Void, Never>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeTask
+    }
+
+    private func clearCompletedActiveTask() {
+        lock.lock()
+        activeTask = nil
+        lock.unlock()
+    }
+
+    private func finished(id: UUID, result: Result<Int, any Error>) {
+        var successfulBytes: Int?
+        var completions: [(CheckedContinuation<Void, any Error>, Result<Void, any Error>)] = []
+        var terminalFailure: ACPTransportError?
+
+        lock.lock()
+        guard !stopped, let frame = active, frame.id == id else {
+            lock.unlock()
+            return
+        }
+        active = nil
+        activeTask = nil
+        outstandingBytes -= frame.data.count
+
+        switch result {
+        case let .success(bytes):
+            successfulBytes = bytes
+            if let completion = frame.completion { completions.append((completion, .success(()))) }
+            startNextIfNeededLocked()
+
+        case let .failure(error):
+            if let cancellation = error as? FrameWriteWasCancelled, cancellation.wroteBytes == 0 {
+                if let completion = frame.completion {
+                    completions.append((completion, .failure(CancellationError())))
+                }
+                startNextIfNeededLocked()
+            } else {
+                let failure: ACPTransportError
+                if let transportError = error as? ACPTransportError {
+                    failure = transportError
+                } else if let cancellation = error as? FrameWriteWasCancelled {
+                    failure = .writeFailed(
+                        "Outgoing frame was cancelled after \(cancellation.wroteBytes) bytes"
+                    )
+                } else {
+                    failure = .writeFailed(String(describing: error))
+                }
+                stopped = true
+                terminalFailure = failure
+                if let completion = frame.completion {
+                    completions.append((completion, .failure(failure)))
+                }
+                for queued in queue {
+                    if let completion = queued.completion {
+                        completions.append((completion, .failure(failure)))
+                    }
+                }
+                queue.removeAll()
+                outstandingBytes = 0
+            }
+        }
+        lock.unlock()
+
+        for (continuation, completion) in completions {
+            continuation.resume(with: completion)
+        }
+        if let successfulBytes {
+            eventContinuation.yield(.wrote(bytes: successfulBytes))
+        }
+        if let terminalFailure {
+            eventContinuation.yield(.failed(terminalFailure))
+            eventContinuation.finish()
+        }
+    }
+}
+
+private func writeNonblockingFrame(
+    _ data: Data,
+    fileDescriptor: Int32,
+    timeout: Duration
+) throws -> Int {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    return try data.withUnsafeBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+        var written = 0
+        while written < rawBuffer.count {
+            if Task.isCancelled { throw FrameWriteWasCancelled(wroteBytes: written) }
+            if ContinuousClock.now >= deadline { throw ACPTransportError.writeTimedOut }
+
+            let result = Darwin.write(
+                fileDescriptor,
+                baseAddress.advanced(by: written),
+                rawBuffer.count - written
+            )
+            if result > 0 {
+                written += result
+                continue
+            }
+            if result == -1, errno == EINTR { continue }
+            if result == -1, errno == EAGAIN || errno == EWOULDBLOCK {
+                var descriptor = pollfd(fd: fileDescriptor, events: Int16(POLLOUT), revents: 0)
+                let pollResult = Darwin.poll(&descriptor, 1, 25)
+                if pollResult == -1, errno == EINTR { continue }
+                if pollResult == -1 {
+                    throw ACPTransportError.writeFailed(String(cString: strerror(errno)))
+                }
+                if descriptor.revents & Int16(POLLNVAL | POLLERR | POLLHUP) != 0 {
+                    throw ACPTransportError.writeFailed("ACP standard input closed")
+                }
+                continue
+            }
+            throw ACPTransportError.writeFailed(String(cString: strerror(errno)))
+        }
+        return written
+    }
+}
+
+private func abortSpawnedProcess(_ process: SpawnedProcess) {
+    _ = Darwin.kill(process.identity.pid, SIGKILL)
+    try? process.standardInput.close()
+    try? process.standardOutput.close()
+    try? process.standardError.close()
+    var status: Int32 = 0
+    var result: pid_t = -1
+    repeat { result = waitpid(process.identity.pid, &status, 0) } while result == -1 && errno == EINTR
 }
 
 private struct PipeReadError: Error, CustomStringConvertible {

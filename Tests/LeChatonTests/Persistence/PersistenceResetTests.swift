@@ -76,6 +76,51 @@ struct PersistenceResetTests {
         try fresh.close()
     }
 
+    @Test("unopened recovery accepts quick-check-clean invalid selected metadata")
+    func unopenedSemanticMetadataRecovery() async throws {
+        let root = try PersistenceTestSupport.makeApplicationSupportRoot()
+        let repository = try PersistenceTestSupport.makeRepository()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: repository.deletingLastPathComponent())
+        }
+        let locations = PersistenceLocations(applicationSupportRoot: root)
+        let store = try PersistenceStore(applicationSupportRoot: root)
+        let saved = try await store.createThread(.init(
+            repositoryURL: repository,
+            vibeSessionID: "semantic-recovery",
+            title: "Semantic Recovery"
+        ))
+        try await store.close()
+
+        let queue = try PersistenceTestSupport.databaseQueue(at: locations.databaseFile)
+        try await queue.write { db in
+            try db.execute(
+                sql: "DELETE FROM thread_environments WHERE thread_id = ?",
+                arguments: [saved.thread.id.uuidString.lowercased()]
+            )
+        }
+        #expect(try await queue.read { db in
+            try String.fetchOne(db, sql: "PRAGMA quick_check")
+        } == "ok")
+        try queue.close()
+
+        #expect(throws: PersistenceStoreError.self) {
+            _ = try PersistenceStore(applicationSupportRoot: root)
+        }
+
+        let result = try PersistenceStore.recoverFailedLocalMetadata(
+            applicationSupportRoot: root,
+            clock: { Date(timeIntervalSince1970: 450) }
+        )
+        #expect(result.restoredSnapshot.selectedThread == nil)
+        #expect(FileManager.default.fileExists(
+            atPath: result.backupDirectory.appending(path: "LeChaton.sqlite").path
+        ))
+        let fresh = try PersistenceStore(applicationSupportRoot: root)
+        try await fresh.close()
+    }
+
     @Test("unopened recovery refuses healthy, missing, and too-new stores without moving them")
     func unopenedRecoveryRefusals() async throws {
         let healthyRoot = try PersistenceTestSupport.makeApplicationSupportRoot()

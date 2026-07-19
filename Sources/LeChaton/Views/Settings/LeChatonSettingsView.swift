@@ -3,6 +3,7 @@ import SwiftUI
 
 struct SettingsRootView: View {
     let container: ApplicationContainer
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
@@ -11,11 +12,14 @@ struct SettingsRootView: View {
                 ProgressView("Opening local metadata…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             case let .failed(failure):
-                ContentUnavailableView(
-                    failure.title,
-                    systemImage: "exclamationmark.triangle",
-                    description: Text("Resolve this issue in the LeChaton workspace window.")
-                )
+                ContentUnavailableView {
+                    Label(failure.title, systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text("Resolve this issue in the LeChaton workspace window.")
+                } actions: {
+                    Button("Open Workspace") { openWindow(id: "main") }
+                        .buttonStyle(.borderedProminent)
+                }
             case .ready:
                 if let workspace = container.workspace {
                     LeChatonSettingsView(workspace: workspace)
@@ -30,6 +34,7 @@ struct SettingsRootView: View {
 
 struct LeChatonSettingsView: View {
     let workspace: WorkspaceController
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         TabView {
@@ -41,6 +46,11 @@ struct LeChatonSettingsView: View {
         }
         .scenePadding()
         .tint(LeChatonTheme.orange)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if let error = workspace.transientError {
+                SettingsErrorBar(workspace: workspace, message: error)
+            }
+        }
     }
 
     private var executableSettings: some View {
@@ -91,10 +101,23 @@ struct LeChatonSettingsView: View {
                 Text("Executable validation uses a private authentication process. It never becomes the session runtime.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                CurrentAuthenticationControls(workspace: workspace)
             }
 
             if let candidate = workspace.model.executableCandidate {
                 ExecutableCandidateView(workspace: workspace, candidate: candidate)
+            }
+
+            if let issue = workspace.model.issue {
+                Section("Attention") {
+                    Label(issue.title, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(LeChatonTheme.danger)
+                    Text(issue.message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Button("Open Workspace") { openWindow(id: "main") }
+                }
             }
         }
         .formStyle(.grouped)
@@ -104,11 +127,13 @@ struct LeChatonSettingsView: View {
         Form {
             Section("Model and thinking") {
                 if workspace.model.lifecycle != .idle {
-                    ContentUnavailableView(
-                        "Load an idle Thread",
-                        systemImage: "pause.circle",
-                        description: Text("Resume the saved Thread before changing Vibe configuration.")
-                    )
+                    ContentUnavailableView {
+                        Label("Load an idle Thread", systemImage: "pause.circle")
+                    } description: {
+                        Text("Resume the saved Thread before changing Vibe configuration.")
+                    } actions: {
+                        Button("Open Workspace") { openWindow(id: "main") }
+                    }
                     .frame(minHeight: 180)
                 } else if configurationOptions.isEmpty {
                     ContentUnavailableView(
@@ -128,6 +153,16 @@ struct LeChatonSettingsView: View {
                             }
                         }
                     }
+
+                    if isApplyingConfiguration {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(workspace.model.activity ?? "Applying and reloading from Vibe…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
 
@@ -138,6 +173,7 @@ struct LeChatonSettingsView: View {
                         systemImage: "arrow.clockwise.circle"
                     )
                     .foregroundStyle(.orange)
+                    Button("Open Workspace to Resume") { openWindow(id: "main") }
                 }
             }
 
@@ -151,7 +187,12 @@ struct LeChatonSettingsView: View {
     }
 
     private var canValidateExecutable: Bool {
-        workspace.model.lifecycle == .unloaded || workspace.model.lifecycle == .idle
+        switch workspace.model.lifecycle {
+        case .unloaded, .idle, .swapFailed:
+            return true
+        default:
+            return false
+        }
     }
 
     private var currentAuthenticationLabel: String {
@@ -170,6 +211,95 @@ struct LeChatonSettingsView: View {
 
     private var isApplyingConfiguration: Bool {
         workspace.model.configurationState != .effectiveFromVibe
+    }
+}
+
+private struct SettingsErrorBar: View {
+    let workspace: WorkspaceController
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Label("Action failed", systemImage: "xmark.circle")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(LeChatonTheme.danger)
+            Text(message)
+                .font(.caption)
+                .lineLimit(2)
+                .textSelection(.enabled)
+            Spacer()
+            Button("Dismiss") { workspace.dismissTransientError() }
+                .controlSize(.small)
+        }
+        .padding(10)
+        .background(.regularMaterial)
+        .overlay(alignment: .top) {
+            Rectangle().fill(LeChatonTheme.danger.opacity(0.45)).frame(height: 1)
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct CurrentAuthenticationControls: View {
+    let workspace: WorkspaceController
+
+    var body: some View {
+        if let attempt = workspace.model.currentAuthenticationAttempt {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Finish sign-in in the browser, then verify it on the same Vibe authentication process.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Link("Open Sign-In Page", destination: attempt.signInURL)
+                    Button("I Finished Signing In") {
+                        Task {
+                            await workspace.completeCurrentAuthentication(attemptID: attempt.id)
+                        }
+                    }
+                    .disabled(isBusy)
+
+                    if isBusy {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(workspace.model.activity ?? "Checking authentication…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        } else {
+            HStack {
+                Button("Refresh Status") {
+                    Task { await workspace.refreshCurrentAuthentication() }
+                }
+                .disabled(isBusy)
+
+                if isAuthenticated != true {
+                    Button("Sign In…") {
+                        Task { await workspace.startCurrentAuthentication() }
+                    }
+                    .disabled(isBusy)
+                }
+
+                if isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(workspace.model.activity ?? "Checking authentication…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var isAuthenticated: Bool? {
+        guard case let .status(status) = workspace.model.authentication else { return nil }
+        return status.isAuthenticated
+    }
+
+    private var isBusy: Bool {
+        workspace.model.lifecycle == .validatingExecutable
+            || workspace.model.lifecycle == .swappingExecutable
     }
 }
 
@@ -199,16 +329,19 @@ private struct ExecutableCandidateView: View {
                                 await workspace.completeCandidateAuthentication(attemptID: attempt.id)
                             }
                         }
+                        .disabled(isBusy)
                     }
                 }
             } else if candidate.authentication.isAuthenticated != true {
                 Button("Sign In…") {
                     Task { await workspace.startCandidateAuthentication() }
                 }
+                .disabled(isBusy)
             }
 
             HStack {
                 Button("Discard") { Task { await workspace.discardExecutableCandidate() } }
+                    .disabled(isBusy)
                 Spacer()
                 Button("Use This Executable") {
                     Task { await workspace.commitExecutableCandidate() }
@@ -216,9 +349,24 @@ private struct ExecutableCandidateView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(LeChatonTheme.orange)
                 .foregroundStyle(LeChatonTheme.onAccent)
-                .disabled(candidate.authentication.isAuthenticated != true)
+                .disabled(candidate.authentication.isAuthenticated != true || isBusy)
+            }
+
+            if isBusy {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(workspace.model.activity ?? "Working with the validated executable…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
+    }
+
+    private var isBusy: Bool {
+        workspace.model.lifecycle == .validatingExecutable
+            || workspace.model.lifecycle == .swappingExecutable
     }
 }
 
@@ -244,6 +392,11 @@ private struct ConfigurationOptionView: View {
             }
             .disabled(isApplying || option.choices.count <= 1)
             .help(option.choices.count <= 1 ? "Vibe advertised no alternative value" : "Changing this value reloads the session")
+            .accessibilityHint(
+                option.choices.count <= 1
+                    ? "Vibe advertised no alternative value"
+                    : "Changing this value reloads the session before it is published"
+            )
 
         case .boolean:
             Toggle(

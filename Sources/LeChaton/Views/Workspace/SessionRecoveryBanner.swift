@@ -19,9 +19,15 @@ struct SessionRecoveryBanner: View {
                 .foregroundStyle(LeChatonTheme.secondaryText)
                 .textSelection(.enabled)
 
-            HStack(spacing: 8) {
-                ForEach(visibleActions, id: \.self) { action in
-                    actionControl(action)
+            if issue.kind == .authenticationRequired {
+                CurrentAuthenticationRecoveryControls(workspace: workspace)
+            }
+
+            if !visibleActions.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(visibleActions, id: \.self) { action in
+                        actionControl(action)
+                    }
                 }
             }
         }
@@ -34,6 +40,9 @@ struct SessionRecoveryBanner: View {
     @ViewBuilder
     private func actionControl(_ action: SessionRecoveryAction) -> some View {
         if action == .retryCandidate {
+            Button("Retry Candidate") {
+                Task { await workspace.retryExecutableCandidate() }
+            }
             SettingsLink {
                 Text("Open Settings")
             }
@@ -59,7 +68,19 @@ struct SessionRecoveryBanner: View {
     /// Destructive metadata recovery is only exposed by the typed startup
     /// corruption/migration screen, never while a healthy store is open.
     private var visibleActions: [SessionRecoveryAction] {
-        issue.actions.filter { $0 != .resetLocalMetadata }
+        issue.actions.filter { action in
+            guard action != .resetLocalMetadata else { return false }
+            if action == .retry,
+               workspace.model.selectedThread == nil,
+               issue.kind != .database
+            {
+                return false
+            }
+            if action == .removeSavedThread, workspace.model.selectedThread == nil {
+                return false
+            }
+            return true
+        }
     }
 
     private func label(for action: SessionRecoveryAction) -> String {
@@ -68,7 +89,7 @@ struct SessionRecoveryBanner: View {
         case .resetRuntime: "Reset Runtime"
         case .removeSavedThread: "Remove Saved Thread"
         case .retryCleanup: "Retry Cleanup"
-        case .retryCandidate: "Open Settings"
+        case .retryCandidate: "Retry Candidate"
         case .resetLocalMetadata: "Reset Local Metadata"
         case .revealDatabase: "Reveal Database"
         case .exportDiagnostic: "Export Diagnostic"
@@ -91,11 +112,11 @@ struct SessionRecoveryBanner: View {
         case .resetRuntime:
             onResetRuntime()
         case .retryCleanup:
-            Task { await workspace.resetRuntime() }
+            Task { await workspace.retryCleanup() }
         case .removeSavedThread:
             onRemoveThread()
         case .retryCandidate:
-            break
+            Task { await workspace.retryExecutableCandidate() }
         case .resetLocalMetadata:
             break
         case .revealDatabase:
@@ -107,5 +128,46 @@ struct SessionRecoveryBanner: View {
         case .quit:
             NSApp.terminate(nil)
         }
+    }
+}
+
+private struct CurrentAuthenticationRecoveryControls: View {
+    let workspace: WorkspaceController
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let attempt = workspace.model.currentAuthenticationAttempt {
+                Link("Open Sign-In Page", destination: attempt.signInURL)
+                Button("I Finished Signing In") {
+                    Task {
+                        await workspace.completeCurrentAuthentication(attemptID: attempt.id)
+                    }
+                }
+                .disabled(isBusy)
+            } else {
+                Button("Sign In…") {
+                    Task { await workspace.startCurrentAuthentication() }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(LeChatonTheme.orange)
+                .foregroundStyle(LeChatonTheme.onAccent)
+                .disabled(isBusy)
+            }
+
+            SettingsLink {
+                Text("Open Settings")
+            }
+
+            if isBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Authentication in progress")
+            }
+        }
+    }
+
+    private var isBusy: Bool {
+        workspace.model.lifecycle == .validatingExecutable
+            || workspace.model.lifecycle == .swappingExecutable
     }
 }

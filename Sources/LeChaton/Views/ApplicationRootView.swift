@@ -33,6 +33,8 @@ struct ApplicationRootView: View {
                     .padding(42)
                 }
                 .accessibilityElement(children: .combine)
+                .accessibilityLabel("Opening local metadata")
+                .accessibilityHint("No Vibe process starts until you choose Resume or New Thread")
 
             case .ready:
                 if let workspace = container.workspace {

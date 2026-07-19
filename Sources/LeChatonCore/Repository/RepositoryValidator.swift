@@ -12,6 +12,22 @@ public struct CanonicalRepository: Equatable, Hashable, Sendable {
     }
 }
 
+public struct RepositoryValidationLimits: Equatable, Sendable {
+    public let maximumOutputBytes: Int
+    public let maximumOutputLines: Int
+    public let commandTimeout: Duration
+
+    public init(
+        maximumOutputBytes: Int = 128 * 1_024,
+        maximumOutputLines: Int = 2_000,
+        commandTimeout: Duration = .seconds(10)
+    ) {
+        self.maximumOutputBytes = max(0, maximumOutputBytes)
+        self.maximumOutputLines = max(0, maximumOutputLines)
+        self.commandTimeout = commandTimeout < .zero ? .zero : commandTimeout
+    }
+}
+
 public enum RepositoryValidationError: Error, Equatable, Sendable, CustomStringConvertible {
     case pathDoesNotExist(String)
     case notDirectory(String)
@@ -21,6 +37,9 @@ public enum RepositoryValidationError: Error, Equatable, Sendable, CustomStringC
     case bareRepository(String)
     case invalidHEAD(String)
     case gitFailure(arguments: [String], status: Int32, message: String)
+    case gitTimedOut(arguments: [String])
+    case gitOutputTooLarge(arguments: [String])
+    case gitCleanupIncomplete(arguments: [String])
     case invalidGitOutput(String)
 
     public var description: String {
@@ -34,6 +53,12 @@ public enum RepositoryValidationError: Error, Equatable, Sendable, CustomStringC
         case let .invalidHEAD(path): "Git worktree does not have a valid HEAD commit: \(path)"
         case let .gitFailure(arguments, status, message):
             "Git \(arguments.joined(separator: " ")) failed with status \(status): \(message)"
+        case let .gitTimedOut(arguments):
+            "Git \(arguments.joined(separator: " ")) timed out"
+        case let .gitOutputTooLarge(arguments):
+            "Git \(arguments.joined(separator: " ")) exceeded repository-validation output limits"
+        case let .gitCleanupIncomplete(arguments):
+            "Git \(arguments.joined(separator: " ")) left a process or descendant alive"
         case let .invalidGitOutput(message): "Git returned invalid repository metadata: \(message)"
         }
     }
@@ -42,12 +67,20 @@ public enum RepositoryValidationError: Error, Equatable, Sendable, CustomStringC
 /// Validates and canonicalizes repositories without mutating Git state.
 public struct RepositoryValidator: Sendable {
     public let gitExecutableURL: URL
+    public let limits: RepositoryValidationLimits
+    private let runner: GitCommandRunner
 
-    public init(gitExecutableURL: URL = URL(filePath: "/usr/bin/git")) {
+    public init(
+        gitExecutableURL: URL = URL(filePath: "/usr/bin/git"),
+        limits: RepositoryValidationLimits = RepositoryValidationLimits()
+    ) {
         self.gitExecutableURL = gitExecutableURL
+        self.limits = limits
+        runner = GitCommandRunner(executableURL: gitExecutableURL)
     }
 
-    public func validate(_ candidate: URL) throws -> CanonicalRepository {
+    public func validate(_ candidate: URL) async throws -> CanonicalRepository {
+        try Task.checkCancellation()
         let candidatePath = candidate.path
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: candidatePath, isDirectory: &isDirectory) else {
@@ -62,7 +95,7 @@ public struct RepositoryValidator: Sendable {
             throw RepositoryValidationError.gitUnavailable(gitExecutableURL.path)
         }
 
-        let flags = try runGit(
+        let flags = try await runGit(
             ["rev-parse", "--is-inside-work-tree", "--is-bare-repository"],
             workingDirectory: URL(filePath: canonicalCandidate)
         ).split(whereSeparator: \Character.isNewline)
@@ -74,7 +107,7 @@ public struct RepositoryValidator: Sendable {
         }
 
         do {
-            _ = try runGit(
+            _ = try await runGit(
                 ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
                 workingDirectory: URL(filePath: canonicalCandidate)
             )
@@ -85,7 +118,7 @@ public struct RepositoryValidator: Sendable {
             throw error
         }
 
-        let topLevelOutput = try runGit(
+        let topLevelOutput = try await runGit(
             ["rev-parse", "--show-toplevel"],
             workingDirectory: URL(filePath: canonicalCandidate)
         )
@@ -111,41 +144,44 @@ public struct RepositoryValidator: Sendable {
         return value.hasSuffix("/") ? String(value.dropLast()) : value
     }
 
-    private func runGit(_ arguments: [String], workingDirectory: URL) throws -> String {
-        let process = Process()
-        process.executableURL = gitExecutableURL
-        process.arguments = arguments
-        process.currentDirectoryURL = workingDirectory
-        process.environment = [
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "LC_ALL": "C",
-        ]
-
-        let standardOutput = Pipe()
-        let standardError = Pipe()
-        process.standardOutput = standardOutput
-        process.standardError = standardError
+    private func runGit(_ arguments: [String], workingDirectory: URL) async throws -> String {
+        try Task.checkCancellation()
+        let result: GitCommandResult
         do {
-            try process.run()
+            result = try await runner.run(
+                arguments: arguments,
+                workingDirectory: workingDirectory,
+                maximumBytes: limits.maximumOutputBytes,
+                maximumLines: limits.maximumOutputLines,
+                timeout: limits.commandTimeout
+            )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw RepositoryValidationError.gitUnavailable(gitExecutableURL.path)
         }
-        process.waitUntilExit()
-
-        let outputData = standardOutput.fileHandleForReading.readDataToEndOfFile()
-        let errorData = standardError.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0 else {
-            let message = String(decoding: errorData.prefix(8_192), as: UTF8.self)
+        guard !result.leftDescendants else {
+            throw RepositoryValidationError.gitCleanupIncomplete(arguments: arguments)
+        }
+        guard !result.timedOut else {
+            throw RepositoryValidationError.gitTimedOut(arguments: arguments)
+        }
+        guard !result.truncated else {
+            throw RepositoryValidationError.gitOutputTooLarge(arguments: arguments)
+        }
+        guard result.exitCode == 0 else {
+            let message = String(decoding: result.stderr.prefix(8_192), as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw RepositoryValidationError.gitFailure(
                 arguments: arguments,
-                status: process.terminationStatus,
+                status: result.exitCode,
                 message: message
             )
         }
-        guard let output = String(data: outputData, encoding: .utf8) else {
-            throw RepositoryValidationError.invalidGitOutput("non-UTF-8 output")
+        guard !result.stdout.contains(0),
+              let output = String(data: result.stdout, encoding: .utf8)
+        else {
+            throw RepositoryValidationError.invalidGitOutput("non-UTF-8 or NUL-containing output")
         }
         return output
     }

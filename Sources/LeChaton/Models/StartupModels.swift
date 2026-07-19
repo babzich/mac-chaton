@@ -18,31 +18,41 @@ struct DatabaseStartupFailure: Equatable {
     let title: String
     let message: String
     let details: String
+    let recoveryBackupURL: URL?
 
     init(error: any Error) {
         details = String(describing: error)
+        if case let PersistenceStoreError.resetRecreationFailed(backupDirectory, _) = error {
+            recoveryBackupURL = backupDirectory
+        } else {
+            recoveryBackupURL = nil
+        }
         switch error {
         case PersistenceStoreError.schemaTooNew:
             kind = .schemaTooNew
             title = "LeChaton needs an update"
             message = "This local metadata store was created by a newer version. It has not been changed."
-        case PersistenceStoreError.corruptDatabase, PersistenceStoreError.migrationFailed:
+        case PersistenceStoreError.corruptDatabase,
+             PersistenceStoreError.migrationFailed,
+             PersistenceStoreError.invalidStoredMetadata:
             kind = .recoverable
             title = "Local metadata needs recovery"
             message = "Vibe history is untouched. LeChaton can move its database to Recovery before creating a fresh store."
         default:
             kind = .unavailable
             title = "Local metadata is unavailable"
-            message = "LeChaton could not open its app-owned metadata. Vibe history has not been changed."
+            if recoveryBackupURL != nil {
+                message = "The previous Database directory was preserved in Recovery, but LeChaton could not create a fresh metadata store."
+            } else {
+                message = "LeChaton could not open its app-owned metadata. Vibe history has not been changed."
+            }
         }
     }
 }
 
-enum WorkspaceDestination: String, Hashable, Identifiable {
+enum WorkspaceDestination: String, Hashable {
     case conversation
     case changes
-
-    var id: String { rawValue }
 }
 
 enum ThreadCreationMode: Equatable {

@@ -12,6 +12,7 @@ public final class SessionModel {
     public private(set) var configurationOptions: [VibeConfigurationOption] = []
     public private(set) var configurationState: ConfigurationApplicationState = .effectiveFromVibe
     public private(set) var authentication: SessionAuthenticationPresentation = .unknown
+    public private(set) var currentAuthenticationAttempt: VibeDelegatedAuthenticationAttempt?
     public private(set) var trust: SessionTrustPresentation = .unknown
     public private(set) var pendingPermissions: [PendingPermission] = []
     public private(set) var executableCandidate: ExecutableCandidatePresentation?
@@ -28,6 +29,7 @@ public final class SessionModel {
     }
 
     public var canPrompt: Bool { lifecycle == .idle && activeRuntime?.sessionID != nil }
+    public var hasPendingRepositoryTrustAction: Bool { pendingTrustAction != nil }
     public var hasPendingCleanup: Bool {
         pendingRuntimeCleanup != nil || pendingAuthCleanup != nil || pendingCandidateCleanup != nil
     }
@@ -35,10 +37,14 @@ public final class SessionModel {
     @ObservationIgnored private let dependencies: SessionModelDependencies
     @ObservationIgnored private var reducer = SessionReducer()
     @ObservationIgnored private var activeRuntime: ActiveRuntime?
+    @ObservationIgnored private var provisionalRuntimeOwner: (any SessionRuntime)?
     @ObservationIgnored private var loadContext: LoadContext?
     @ObservationIgnored private var authOwner: (any SessionAuthenticationOwner)?
     @ObservationIgnored private var authOwnerExecutablePath: String?
     @ObservationIgnored private var candidateContext: CandidateContext?
+    @ObservationIgnored private var provisionalCandidateOwner: (any SessionAuthenticationCandidate)?
+    @ObservationIgnored private var authenticationPromotionOperation: AuthenticationPromotionOperation?
+    @ObservationIgnored private var repositoryValidationOperation: RepositoryValidationOperation?
     @ObservationIgnored private var updateTask: Task<Void, Never>?
     @ObservationIgnored private var requestTask: Task<Void, Never>?
     @ObservationIgnored private var diagnosticTask: Task<Void, Never>?
@@ -47,8 +53,31 @@ public final class SessionModel {
     @ObservationIgnored private var pendingRuntimeCleanup: (any SessionRuntime)?
     @ObservationIgnored private var pendingAuthCleanup: (any SessionAuthenticationOwner)?
     @ObservationIgnored private var pendingCandidateCleanup: (any SessionAuthenticationCandidate)?
+    @ObservationIgnored private var runtimeCleanupOperation: CleanupOperation?
+    @ObservationIgnored private var authCleanupOperation: CleanupOperation?
+    @ObservationIgnored private var candidateCleanupOperation: CleanupOperation?
     @ObservationIgnored private var cleanupSuccessLifecycle: SessionLifecycle = .unloaded
     @ObservationIgnored private var pendingTrustAction: PendingTrustAction?
+    @ObservationIgnored private var isShuttingDown = false
+    @ObservationIgnored private var shutdownInProgress = false
+    @ObservationIgnored private var shutdownSucceeded = false
+    @ObservationIgnored private var lastShutdownAttemptResult: Bool?
+    @ObservationIgnored private var shutdownWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private struct CleanupOperation: Sendable {
+        let id: UUID
+        let task: Task<ProcessCleanupReport?, any Error>
+    }
+
+    private struct AuthenticationPromotionOperation: Sendable {
+        let id: UUID
+        let task: Task<SessionAuthenticationPromotion, any Error>
+    }
+
+    private struct RepositoryValidationOperation: Sendable {
+        let id: UUID
+        let task: Task<CanonicalRepository, any Error>
+    }
 
     private struct ActiveRuntime: Sendable {
         let id: UUID
@@ -96,16 +125,19 @@ public final class SessionModel {
 
     /// Restores only app-owned metadata. No Vibe, auth, or candidate process is created here.
     public func restoreLaunchMetadata() async {
+        guard !isShuttingDown else { return }
         guard activeRuntime == nil, authOwner == nil, candidateContext == nil else { return }
         activity = "Loading local metadata"
         issue = nil
         do {
             let snapshot = try await dependencies.persistence.restoreMetadata()
+            guard !isShuttingDown else { return }
             selectedThread = snapshot.selectedThread
             selectedVibePath = snapshot.settings.selectedVibePath
             lifecycle = .unloaded
             clearRuntimePresentation(keepKnownGood: false)
         } catch {
+            guard !isShuttingDown else { return }
             lifecycle = .failed(String(describing: error))
             issue = databaseIssue(error)
         }
@@ -113,6 +145,7 @@ public final class SessionModel {
     }
 
     public func resume() async {
+        guard !isShuttingDown else { return }
         guard selectedThread != nil else {
             issue = runtimeIssue(SessionModelError.noSavedThread)
             return
@@ -136,7 +169,8 @@ public final class SessionModel {
         do {
             let metadata = try requireSelectedThread()
             let cwd = URL(filePath: metadata.environment.cwd, directoryHint: .isDirectory)
-            _ = try RepositoryValidator().validate(cwd)
+            _ = try await validateRepository(cwd)
+            try ensureOperational()
             let executable = try dependencies.locateExecutable(selectedVibePath)
             let runtime = try await prepareRuntime(executable: executable, cwd: cwd)
             try await loadSelectedThread(
@@ -145,6 +179,7 @@ public final class SessionModel {
                 preserveKnownGoodOnFailure: preserveKnownGood
             )
         } catch {
+            guard !isShuttingDown else { return }
             if isRepositoryTrustRequired(error) { pendingTrustAction = .resume }
             await failLoadOrPreparation(error, preserveKnownGood: preserveKnownGood)
         }
@@ -152,6 +187,7 @@ public final class SessionModel {
     }
 
     public func createThread(repositoryURL: URL, title: String) async {
+        guard !isShuttingDown else { return }
         guard selectedThread == nil, activeRuntime == nil else {
             issue = runtimeIssue(SessionModelError.invalidLifecycle(
                 expected: "no selected Thread",
@@ -172,7 +208,8 @@ public final class SessionModel {
         issue = nil
         activity = "Creating Vibe session"
         do {
-            let repository = try RepositoryValidator().validate(repositoryURL)
+            let repository = try await validateRepository(repositoryURL)
+            try ensureOperational()
             let executable = try dependencies.locateExecutable(selectedVibePath)
             let runtime = try await prepareRuntime(
                 executable: executable,
@@ -183,6 +220,7 @@ public final class SessionModel {
                 directoryHint: .isDirectory
             )
             let result = try await runtime.owner.newSession(cwd: canonicalRepositoryURL)
+            try ensureOperational()
             guard activeRuntime?.id == runtime.id else { throw SessionModelError.staleRuntime }
             let decodedOptions = try decodeConfigurationOptions(result.configurationOptions)
 
@@ -196,9 +234,12 @@ public final class SessionModel {
             let metadata: SavedThreadMetadata
             do {
                 metadata = try await dependencies.persistence.createThread(request)
+                try ensureOperational()
             } catch {
+                guard !isShuttingDown else { return }
                 let owner = invalidateRuntime(clearPresentation: true)
                 try await stopVerified(owner)
+                guard !isShuttingDown else { return }
                 lifecycle = .unloaded
                 issue = .init(
                     kind: .persistence,
@@ -217,9 +258,11 @@ public final class SessionModel {
                 let owner = invalidateRuntime(clearPresentation: true)
                 do {
                     try await stopVerified(owner)
+                    guard !isShuttingDown else { return }
                     lifecycle = .failed(SessionModelError.staleRuntime.description)
                     issue = runtimeIssue(SessionModelError.staleRuntime)
                 } catch {
+                    guard !isShuttingDown else { return }
                     cleanupSuccessLifecycle = .unloaded
                     lifecycle = .cleanupRequired
                     issue = cleanupIssue(error)
@@ -234,6 +277,7 @@ public final class SessionModel {
             configurationState = .effectiveFromVibe
             lifecycle = .idle
         } catch {
+            guard !isShuttingDown else { return }
             if isRepositoryTrustRequired(error) {
                 pendingTrustAction = .create(repositoryURL: repositoryURL, title: title)
             }
@@ -245,6 +289,7 @@ public final class SessionModel {
     /// Applies exactly one decision advertised by Vibe, then retries the
     /// interrupted create/load/replace operation through a fresh process.
     public func resolveRepositoryTrust(decision: String) async {
+        guard !isShuttingDown else { return }
         guard let action = pendingTrustAction,
               case let .status(status) = trust,
               status.options.compactMap(\.stringValue).contains(decision)
@@ -269,30 +314,23 @@ public final class SessionModel {
         lifecycle = .replacingThread
         activity = "Applying repository trust decision"
         do {
-            let repository = try RepositoryValidator().validate(cwd)
+            let repository = try await validateRepository(cwd)
             let canonicalCWD = URL(filePath: repository.path, directoryHint: .isDirectory)
             let executable = try dependencies.locateExecutable(selectedVibePath)
             let authSnapshot = try await ensureAuthentication(executable: executable, requireReady: true)
+            try ensureOperational()
             authentication = .status(authSnapshot.status)
+            let active = try await startRuntimeOwner(executable: executable, cwd: canonicalCWD)
 
-            let owner = dependencies.makeRuntime(executable, canonicalCWD)
-            let started = try await owner.start()
-            let active = ActiveRuntime(
-                id: dependencies.makeUUID(),
-                owner: owner,
-                generation: started.generation,
-                sessionID: nil
-            )
-            activeRuntime = active
-            startConsumers(for: active)
-
-            let updated = try await owner.applyRepositoryTrustDecision(
+            let updated = try await active.owner.applyRepositoryTrustDecision(
                 cwd: canonicalCWD,
                 decision: decision
             )
+            try ensureOperational()
             guard activeRuntime?.id == active.id else { throw SessionModelError.staleRuntime }
             let stoppedOwner = invalidateRuntime(clearPresentation: true)
             try await stopVerified(stoppedOwner)
+            try ensureOperational()
             trust = .status(updated)
 
             guard updated.state == .trusted else {
@@ -316,12 +354,59 @@ public final class SessionModel {
                 await replaceSavedThread(repositoryURL: repositoryURL, title: title)
             }
         } catch {
+            guard !isShuttingDown else { return }
             await failLoadOrPreparation(error, preserveKnownGood: false)
             activity = nil
         }
     }
 
+    /// Re-runs the exact operation that was interrupted by Vibe's trust gate.
+    /// This is the recovery path when Vibe advertises no decision LeChaton can
+    /// present: the user can resolve trust outside the app, then retry without
+    /// LeChaton fabricating a decision value.
+    public func retryPendingRepositoryTrust() async {
+        guard !isShuttingDown else { return }
+        guard let action = pendingTrustAction else { return }
+        guard activeRuntime == nil, !hasPendingCleanup else {
+            issue = cleanupIssue(SessionModelError.cleanupOutstanding)
+            return
+        }
+
+        pendingTrustAction = nil
+        trust = .unknown
+        issue = nil
+        lifecycle = .unloaded
+        activity = nil
+
+        switch action {
+        case let .create(repositoryURL, title):
+            await createThread(repositoryURL: repositoryURL, title: title)
+        case .resume:
+            await resume()
+        case let .replace(repositoryURL, title):
+            await replaceSavedThread(repositoryURL: repositoryURL, title: title)
+        }
+    }
+
+    /// Abandons the interrupted operation while keeping any saved Thread
+    /// metadata intact. The trust decision itself is never stored by LeChaton.
+    public func cancelPendingRepositoryTrust() {
+        guard !isShuttingDown else { return }
+        guard pendingTrustAction != nil else { return }
+        guard activeRuntime == nil, !hasPendingCleanup else {
+            issue = cleanupIssue(SessionModelError.cleanupOutstanding)
+            return
+        }
+
+        pendingTrustAction = nil
+        trust = .unknown
+        issue = nil
+        lifecycle = .unloaded
+        activity = nil
+    }
+
     public func replaceSavedThread(repositoryURL: URL, title: String) async {
+        guard !isShuttingDown else { return }
         guard let oldMetadata = selectedThread else {
             await createThread(repositoryURL: repositoryURL, title: title)
             return
@@ -341,7 +426,9 @@ public final class SessionModel {
         let oldOwner = invalidateRuntime(clearPresentation: true)
         do {
             try await stopVerified(oldOwner)
+            try ensureOperational()
         } catch {
+            guard !isShuttingDown else { return }
             selectedThread = oldMetadata
             cleanupSuccessLifecycle = .unloaded
             lifecycle = .cleanupRequired
@@ -351,7 +438,8 @@ public final class SessionModel {
         }
 
         do {
-            let repository = try RepositoryValidator().validate(repositoryURL)
+            let repository = try await validateRepository(repositoryURL)
+            try ensureOperational()
             let executable = try dependencies.locateExecutable(selectedVibePath)
             activity = "Creating replacement session"
             let runtime = try await prepareRuntime(
@@ -363,6 +451,7 @@ public final class SessionModel {
                 directoryHint: .isDirectory
             )
             let newSession = try await runtime.owner.newSession(cwd: canonicalRepositoryURL)
+            try ensureOperational()
             guard activeRuntime?.id == runtime.id else { throw SessionModelError.staleRuntime }
             let decodedOptions = try decodeConfigurationOptions(newSession.configurationOptions)
             let request = CreateThreadRequest(
@@ -379,9 +468,12 @@ public final class SessionModel {
                     oldMetadata.thread.id,
                     request
                 )
+                try ensureOperational()
             } catch {
+                guard !isShuttingDown else { return }
                 let owner = invalidateRuntime(clearPresentation: true)
                 try await stopVerified(owner)
+                guard !isShuttingDown else { return }
                 selectedThread = oldMetadata
                 lifecycle = .unloaded
                 issue = .init(
@@ -401,9 +493,11 @@ public final class SessionModel {
                 let owner = invalidateRuntime(clearPresentation: true)
                 do {
                     try await stopVerified(owner)
+                    guard !isShuttingDown else { return }
                     lifecycle = .failed(SessionModelError.staleRuntime.description)
                     issue = runtimeIssue(SessionModelError.staleRuntime)
                 } catch {
+                    guard !isShuttingDown else { return }
                     cleanupSuccessLifecycle = .unloaded
                     lifecycle = .cleanupRequired
                     issue = cleanupIssue(error)
@@ -416,16 +510,19 @@ public final class SessionModel {
             configurationState = .effectiveFromVibe
             lifecycle = .idle
         } catch {
+            guard !isShuttingDown else { return }
             if isRepositoryTrustRequired(error) {
                 pendingTrustAction = .replace(repositoryURL: repositoryURL, title: title)
             }
             let owner = invalidateRuntime(clearPresentation: true)
             do {
                 try await stopVerified(owner)
+                guard !isShuttingDown else { return }
                 selectedThread = oldMetadata
                 lifecycle = .unloaded
                 issue = runtimeIssue(error)
             } catch {
+                guard !isShuttingDown else { return }
                 selectedThread = oldMetadata
                 cleanupSuccessLifecycle = .unloaded
                 lifecycle = .cleanupRequired
@@ -437,6 +534,7 @@ public final class SessionModel {
 
     @discardableResult
     public func sendPrompt(_ text: String) async throws -> PromptResult {
+        try ensureOperational()
         guard lifecycle == .idle else {
             throw SessionModelError.invalidLifecycle(expected: "Idle", actual: lifecycle)
         }
@@ -454,6 +552,7 @@ public final class SessionModel {
         activity = "Vibe is working"
         do {
             let result = try await runtime.owner.prompt(sessionID: sessionID, text: text)
+            try ensureOperational()
             guard activeRuntime?.id == runtime.id else { throw SessionModelError.staleRuntime }
             if lifecycle != .cancelling {
                 reducer.finishPrompt(failed: false)
@@ -464,6 +563,7 @@ public final class SessionModel {
             }
             return result
         } catch {
+            if isShuttingDown { throw error }
             if lifecycle == .cancelling { throw error }
             reducer.finishPrompt(failed: true)
             sessionState = reducer.state
@@ -473,6 +573,7 @@ public final class SessionModel {
     }
 
     public func resolvePermission(requestID: RPCID, selectedOptionID: String) async throws {
+        try ensureOperational()
         guard let first = pendingPermissions.first, first.id == requestID else {
             throw SessionModelError.invalidLifecycle(
                 expected: "the first pending permission",
@@ -485,6 +586,7 @@ public final class SessionModel {
             id: requestID,
             selectedOptionID: selectedOptionID
         )
+        try ensureOperational()
         guard activeRuntime?.id == runtime.id else { throw SessionModelError.staleRuntime }
         resolvedPermissionIDs.insert(requestID)
         // Cancellation can win while the transport actor is answering. Remove by identity
@@ -495,6 +597,7 @@ public final class SessionModel {
     }
 
     public func cancelPrompt() async {
+        guard !isShuttingDown else { return }
         if lifecycle == .cancelling { return }
         guard lifecycle == .prompting, let runtime = activeRuntime, let sessionID = runtime.sessionID else {
             return
@@ -505,6 +608,7 @@ public final class SessionModel {
         sessionState = reducer.state
         do {
             _ = try await runtime.owner.cancelPrompt(sessionID: sessionID)
+            guard !isShuttingDown else { return }
             guard activeRuntime?.id == runtime.id else { throw SessionModelError.staleRuntime }
             pendingPermissions.removeAll()
             reducer.finishPrompt(failed: false)
@@ -512,6 +616,7 @@ public final class SessionModel {
             lifecycle = .idle
             activity = nil
         } catch {
+            guard !isShuttingDown else { return }
             pendingPermissions.removeAll()
             reducer.finishPrompt(failed: true)
             sessionState = reducer.state
@@ -520,15 +625,18 @@ public final class SessionModel {
     }
 
     public func unload() async {
+        guard !isShuttingDown else { return }
         guard lifecycle == .idle || lifecycle == .unloaded || lifecycle == .reloadRequired || isFailed(lifecycle) else { return }
         lifecycle = .replacingThread
         activity = "Stopping Vibe"
         let owner = invalidateRuntime(clearPresentation: true)
         do {
             try await stopVerified(owner)
+            guard !isShuttingDown else { return }
             lifecycle = .unloaded
             issue = nil
         } catch {
+            guard !isShuttingDown else { return }
             cleanupSuccessLifecycle = .unloaded
             lifecycle = .cleanupRequired
             issue = cleanupIssue(error)
@@ -537,10 +645,12 @@ public final class SessionModel {
     }
 
     public func resetRuntime() async {
+        guard !isShuttingDown else { return }
         await unload()
     }
 
     public func retryCleanup() async {
+        guard !shutdownSucceeded, !shutdownInProgress else { return }
         guard lifecycle == .cleanupRequired || lifecycle == .swapFailed else { return }
         let destination = cleanupSuccessLifecycle
         activity = "Retrying verified process cleanup"
@@ -557,6 +667,17 @@ public final class SessionModel {
                 )
             }
         } else {
+            if isShuttingDown {
+                lifecycle = .cleanupRequired
+                issue = .init(
+                    kind: .cleanupRequired,
+                    title: "Process cleanup completed",
+                    message: "All retained process owners are gone. Quit again to close local metadata safely.",
+                    actions: [.quit]
+                )
+                activity = nil
+                return
+            }
             lifecycle = destination
             switch destination {
             case .swapFailed:
@@ -581,6 +702,7 @@ public final class SessionModel {
     }
 
     public func retryExecutableCandidate() async {
+        guard !isShuttingDown else { return }
         guard lifecycle == .swapFailed, !hasPendingCleanup,
               let selectedVibePath, !selectedVibePath.isEmpty
         else { return }
@@ -588,6 +710,13 @@ public final class SessionModel {
     }
 
     public func removeSavedThread() async {
+        guard !isShuttingDown else { return }
+        // Metadata removal cannot bypass a retained process owner. Keep the
+        // mandatory Retry Cleanup / Quit issue intact until cleanup succeeds.
+        guard !hasPendingCleanup,
+              lifecycle != .cleanupRequired,
+              lifecycle != .swapFailed
+        else { return }
         guard let selectedThread else { return }
         switch lifecycle {
         case .unloaded, .idle, .reloadRequired, .failed:
@@ -603,11 +732,14 @@ public final class SessionModel {
         let owner = invalidateRuntime(clearPresentation: true)
         do {
             try await stopVerified(owner)
+            try ensureOperational()
             _ = try await dependencies.persistence.removeSelectedThread(selectedThread.thread.id)
+            try ensureOperational()
             self.selectedThread = nil
             lifecycle = .unloaded
             issue = nil
         } catch {
+            guard !isShuttingDown else { return }
             if error is SessionModelError {
                 cleanupSuccessLifecycle = .unloaded
                 lifecycle = .cleanupRequired
@@ -625,6 +757,7 @@ public final class SessionModel {
     }
 
     public func applyConfiguration(optionID: String, value: JSONValue) async {
+        guard !isShuttingDown else { return }
         guard lifecycle == .idle,
               let runtime = activeRuntime,
               let sessionID = runtime.sessionID,
@@ -641,10 +774,13 @@ public final class SessionModel {
         configurationState = .candidate(optionID: optionID, value: value)
         lifecycle = .loadingHistory
         await Task.yield()
+        guard !isShuttingDown else { return }
         configurationState = .applying(optionID: optionID, value: value)
         activity = "Applying Vibe configuration"
         issue = nil
-        knownGoodSnapshot = KnownGoodSnapshot(state: sessionState)
+        var snapshotReducer = reducer
+        snapshotReducer.unloadRuntime()
+        knownGoodSnapshot = KnownGoodSnapshot(state: snapshotReducer.state)
 
         do {
             _ = try await runtime.owner.setConfigurationOption(
@@ -653,10 +789,12 @@ public final class SessionModel {
                 kind: option.kind,
                 value: value
             )
+            try ensureOperational()
             guard activeRuntime?.id == runtime.id else { throw SessionModelError.staleRuntime }
 
             let oldOwner = invalidateRuntime(clearPresentation: true, keepKnownGood: true)
             try await stopVerified(oldOwner)
+            try ensureOperational()
             let metadata = try requireSelectedThread()
             let cwd = URL(filePath: metadata.environment.cwd, directoryHint: .isDirectory)
             let executable = try dependencies.locateExecutable(selectedVibePath)
@@ -668,9 +806,11 @@ public final class SessionModel {
             )
             configurationState = .effectiveFromVibe
         } catch {
+            guard !isShuttingDown else { return }
             let owner = invalidateRuntime(clearPresentation: true, keepKnownGood: true)
             do {
                 try await stopVerified(owner)
+                guard !isShuttingDown else { return }
                 lifecycle = .reloadRequired
                 configurationState = .reloadRequired(optionID: optionID, requestedValue: value)
                 issue = .init(
@@ -680,6 +820,7 @@ public final class SessionModel {
                     actions: [.retry, .resetRuntime, .removeSavedThread]
                 )
             } catch {
+                guard !isShuttingDown else { return }
                 cleanupSuccessLifecycle = .reloadRequired
                 lifecycle = .cleanupRequired
                 configurationState = .reloadRequired(optionID: optionID, requestedValue: value)
@@ -689,7 +830,102 @@ public final class SessionModel {
         activity = nil
     }
 
+    /// Re-queries the current executable's lazy authentication owner without
+    /// replacing any process owner or implicitly resuming a saved Thread.
+    public func refreshCurrentAuthentication() async throws {
+        let priorLifecycle = try beginCurrentAuthenticationOperation()
+        activity = "Refreshing Vibe authentication"
+        defer { if !isShuttingDown { activity = nil } }
+
+        do {
+            let executable = try dependencies.locateExecutable(selectedVibePath)
+            let snapshot = try await ensureAuthentication(
+                executable: executable,
+                requireReady: false
+            )
+            authentication = .status(snapshot.status)
+            currentAuthenticationAttempt = await authOwner?.pendingDelegatedAuthentication()
+            try ensureOperational()
+            finishCurrentAuthenticationOperation(
+                priorLifecycle: priorLifecycle,
+                status: snapshot.status
+            )
+        } catch {
+            if isShuttingDown { throw error }
+            await reconcileCurrentAuthentication()
+            finishFailedCurrentAuthenticationOperation(
+                priorLifecycle: priorLifecycle,
+                error: error
+            )
+            throw error
+        }
+    }
+
+    /// Starts delegated browser authentication on the current auth owner. The
+    /// returned attempt must be completed on this same owner/process.
+    @discardableResult
+    public func startCurrentAuthentication() async throws -> URL {
+        let priorLifecycle = try beginCurrentAuthenticationOperation()
+        activity = "Starting Vibe sign-in"
+        defer { if !isShuttingDown { activity = nil } }
+
+        do {
+            let executable = try dependencies.locateExecutable(selectedVibePath)
+            let snapshot = try await ensureAuthentication(
+                executable: executable,
+                requireReady: false
+            )
+            authentication = .status(snapshot.status)
+            guard let authOwner else { throw SessionModelError.authenticationRequired }
+            let attempt = try await authOwner.startDelegatedAuthentication()
+            try ensureOperational()
+            currentAuthenticationAttempt = attempt
+            lifecycle = priorLifecycle
+            return attempt.signInURL
+        } catch {
+            if isShuttingDown { throw error }
+            await reconcileCurrentAuthentication()
+            finishFailedCurrentAuthenticationOperation(
+                priorLifecycle: priorLifecycle,
+                error: error
+            )
+            throw error
+        }
+    }
+
+    /// Completes the pending delegated attempt and publishes Vibe's freshly
+    /// queried status. Authentication never implicitly resumes session history.
+    public func completeCurrentAuthentication(attemptID: String) async throws {
+        let priorLifecycle = try beginCurrentAuthenticationOperation()
+        activity = "Completing Vibe sign-in"
+        defer { if !isShuttingDown { activity = nil } }
+
+        do {
+            guard let authOwner else { throw SessionModelError.authenticationRequired }
+            let status = try await authOwner.completeDelegatedAuthentication(
+                attemptID: attemptID
+            )
+            try ensureOperational()
+            authentication = .status(status)
+            currentAuthenticationAttempt = await authOwner.pendingDelegatedAuthentication()
+            try ensureOperational()
+            finishCurrentAuthenticationOperation(
+                priorLifecycle: priorLifecycle,
+                status: status
+            )
+        } catch {
+            if isShuttingDown { throw error }
+            await reconcileCurrentAuthentication()
+            finishFailedCurrentAuthenticationOperation(
+                priorLifecycle: priorLifecycle,
+                error: error
+            )
+            throw error
+        }
+    }
+
     public func validateExecutableCandidate(_ candidateURL: URL) async {
+        guard !isShuttingDown else { return }
         guard lifecycle == .unloaded || lifecycle == .idle || lifecycle == .swapFailed else {
             issue = runtimeIssue(SessionModelError.invalidLifecycle(
                 expected: "Unloaded, Idle, or Swap Failed",
@@ -716,25 +952,35 @@ public final class SessionModel {
 
             if let oldCandidate = candidateContext?.owner {
                 try await disposeCandidateVerified(oldCandidate)
+                try ensureOperational()
                 candidateContext = nil
                 executableCandidate = nil
             }
             let owner = dependencies.makeAuthenticationCandidate(executable)
             validatingOwner = owner
+            provisionalCandidateOwner = owner
             let snapshot = try await owner.refresh()
+            try ensureOperational()
             candidateContext = .init(
                 executable: executable,
                 owner: owner,
                 authentication: snapshot.status,
                 pendingSignIn: nil
             )
+            provisionalCandidateOwner = nil
             validatingOwner = nil
             publishCandidatePresentation()
             lifecycle = previousLifecycle
         } catch {
+            provisionalCandidateOwner = nil
+            if isShuttingDown {
+                activity = nil
+                return
+            }
             if let owner = validatingOwner ?? candidateContext?.owner {
                 _ = try? await disposeCandidateVerified(owner)
             }
+            guard !isShuttingDown else { return }
             candidateContext = nil
             executableCandidate = nil
             if hasPendingCleanup {
@@ -751,47 +997,56 @@ public final class SessionModel {
 
     @discardableResult
     public func startCandidateAuthentication() async throws -> URL {
+        try ensureOperational()
         guard var context = candidateContext else { throw SessionModelError.noExecutableCandidate }
         let prior = lifecycle
         lifecycle = .validatingExecutable
-        defer { lifecycle = prior }
+        defer { if !isShuttingDown { lifecycle = prior } }
         do {
             let attempt = try await context.owner.startDelegatedAuthentication()
+            try ensureOperational()
             context.pendingSignIn = attempt
             candidateContext = context
             publishCandidatePresentation()
             return attempt.signInURL
         } catch {
+            if isShuttingDown { throw error }
             await reconcileCurrentAuthentication()
             throw error
         }
     }
 
     public func completeCandidateAuthentication(attemptID: String) async throws {
+        try ensureOperational()
         guard var context = candidateContext else { throw SessionModelError.noExecutableCandidate }
         let prior = lifecycle
         lifecycle = .validatingExecutable
-        defer { lifecycle = prior }
+        defer { if !isShuttingDown { lifecycle = prior } }
         do {
             let status = try await context.owner.completeDelegatedAuthentication(attemptID: attemptID)
+            try ensureOperational()
             context.authentication = status
             context.pendingSignIn = nil
             candidateContext = context
             publishCandidatePresentation()
         } catch {
+            if isShuttingDown { throw error }
             await reconcileCurrentAuthentication()
             throw error
         }
     }
 
     public func discardExecutableCandidate() async {
+        guard !isShuttingDown else { return }
         guard let context = candidateContext else { return }
         let previousLifecycle = lifecycle
         lifecycle = .validatingExecutable
         do {
             try await disposeCandidateVerified(context.owner)
+            guard !isShuttingDown else { return }
             lifecycle = previousLifecycle
         } catch {
+            guard !isShuttingDown else { return }
             cleanupSuccessLifecycle = previousLifecycle
             lifecycle = .cleanupRequired
             issue = cleanupIssue(error)
@@ -802,6 +1057,7 @@ public final class SessionModel {
     }
 
     public func commitExecutableCandidate() async {
+        guard !isShuttingDown else { return }
         guard let context = candidateContext else {
             issue = runtimeIssue(SessionModelError.noExecutableCandidate)
             return
@@ -817,8 +1073,10 @@ public final class SessionModel {
 
         do {
             let settings = try await dependencies.persistence.updateSelectedVibePath(context.executable.url)
+            guard !isShuttingDown else { return }
             selectedVibePath = settings.selectedVibePath
         } catch {
+            guard !isShuttingDown else { return }
             let cleanupError: (any Error)?
             do {
                 try await disposeCandidateVerified(context.owner)
@@ -826,6 +1084,7 @@ public final class SessionModel {
             } catch {
                 cleanupError = error
             }
+            guard !isShuttingDown else { return }
             candidateContext = nil
             executableCandidate = nil
             if cleanupError != nil {
@@ -853,17 +1112,21 @@ public final class SessionModel {
         // before the replacement owner is published, as required by ADR 0003.
         lifecycle = .swappingExecutable
         activity = "Replacing Vibe process owners"
-        let sessionOwner = invalidateRuntime(clearPresentation: true)
+        let sessionOwner = invalidateRuntime(clearPresentation: true) ?? provisionalRuntimeOwner
+        provisionalRuntimeOwner = nil
         let oldAuthOwner = authOwner
         authOwner = nil
         authOwnerExecutablePath = nil
         authentication = .unknown
+        currentAuthenticationAttempt = nil
         if let cleanupError = await disposeOwners(
             session: sessionOwner,
             authentication: oldAuthOwner,
             candidate: nil
         ) {
+            guard !isShuttingDown else { return }
             _ = try? await disposeCandidateVerified(context.owner)
+            guard !isShuttingDown else { return }
             candidateContext = nil
             executableCandidate = nil
             cleanupSuccessLifecycle = .swapFailed
@@ -877,9 +1140,27 @@ public final class SessionModel {
             activity = nil
             return
         }
+        guard !isShuttingDown else { return }
 
         do {
-            let promotion = try await context.owner.promote()
+            let promotionID = dependencies.makeUUID()
+            let promotionTask = Task { try await context.owner.promote() }
+            authenticationPromotionOperation = .init(id: promotionID, task: promotionTask)
+            let promotion = try await promotionTask.value
+            guard !isShuttingDown else { return }
+            guard promotion.snapshot.status.isAuthenticated == true else {
+                try await disposeAuthVerified(promotion.owner)
+                try ensureOperational()
+                if authenticationPromotionOperation?.id == promotionID {
+                    authenticationPromotionOperation = nil
+                }
+                throw SessionModelError.candidateAuthenticationRequired
+            }
+            let promotedAttempt = await promotion.owner.pendingDelegatedAuthentication()
+            guard !isShuttingDown else { return }
+            if authenticationPromotionOperation?.id == promotionID {
+                authenticationPromotionOperation = nil
+            }
             candidateContext = nil
             executableCandidate = nil
 
@@ -887,6 +1168,7 @@ public final class SessionModel {
             authOwner = promotion.owner
             authOwnerExecutablePath = context.executable.url.path
             authentication = .status(promotion.snapshot.status)
+            currentAuthenticationAttempt = promotedAttempt
             trust = .unknown
             pendingPermissions.removeAll()
             reducer.reset()
@@ -897,12 +1179,16 @@ public final class SessionModel {
             lifecycle = .unloaded
             issue = nil
         } catch {
+            authenticationPromotionOperation = nil
+            guard !isShuttingDown else { return }
             _ = try? await disposeCandidateVerified(context.owner)
+            guard !isShuttingDown else { return }
             candidateContext = nil
             executableCandidate = nil
             authOwner = nil
             authOwnerExecutablePath = nil
             authentication = .unknown
+            currentAuthenticationAttempt = nil
             cleanupSuccessLifecycle = .swapFailed
             lifecycle = .swapFailed
             issue = .init(
@@ -916,23 +1202,19 @@ public final class SessionModel {
     }
 
     public func resetLocalMetadata() async {
+        guard !isShuttingDown else { return }
         lifecycle = .replacingThread
         activity = "Stopping processes before metadata recovery"
         issue = nil
-        let sessionOwner = invalidateRuntime(clearPresentation: true)
-        let owner = authOwner
-        authOwner = nil
-        authOwnerExecutablePath = nil
-        let candidate = candidateContext?.owner
-        candidateContext = nil
-        executableCandidate = nil
-        authentication = .unknown
+        let owners = detachAllOwners()
 
-        if let cleanupError = await disposeOwners(
-            session: sessionOwner,
-            authentication: owner,
-            candidate: candidate
-        ) {
+        let cleanupError = await disposeOwners(
+            session: owners.session,
+            authentication: owners.authentication,
+            candidate: owners.candidate
+        )
+        guard !isShuttingDown else { return }
+        if let cleanupError {
             cleanupSuccessLifecycle = .unloaded
             lifecycle = .cleanupRequired
             issue = .init(
@@ -943,12 +1225,14 @@ public final class SessionModel {
             )
         } else {
             do {
-            let result = try await dependencies.persistence.resetLocalMetadata()
-            lastRecoveryBackupURL = result.backupDirectory
-            selectedThread = result.restoredSnapshot.selectedThread
-            selectedVibePath = result.restoredSnapshot.settings.selectedVibePath
-            lifecycle = .unloaded
+                let result = try await dependencies.persistence.resetLocalMetadata()
+                guard !isShuttingDown else { return }
+                lastRecoveryBackupURL = result.backupDirectory
+                selectedThread = result.restoredSnapshot.selectedThread
+                selectedVibePath = result.restoredSnapshot.settings.selectedVibePath
+                lifecycle = .unloaded
             } catch {
+                guard !isShuttingDown else { return }
                 lifecycle = .failed(String(describing: error))
                 issue = databaseIssue(error)
             }
@@ -956,62 +1240,163 @@ public final class SessionModel {
         activity = nil
     }
 
-    public func shutdown() async {
-        let sessionOwner = invalidateRuntime(clearPresentation: true)
-        let owner = authOwner
-        authOwner = nil
-        authOwnerExecutablePath = nil
-        let candidate = candidateContext?.owner
-        candidateContext = nil
-        executableCandidate = nil
-        authentication = .unknown
+    @discardableResult
+    public func shutdown() async -> Bool {
+        if shutdownSucceeded { return true }
+        if shutdownInProgress {
+            await withCheckedContinuation { continuation in
+                shutdownWaiters.append(continuation)
+            }
+            return lastShutdownAttemptResult ?? false
+        }
+        isShuttingDown = true
+        shutdownInProgress = true
+        lastShutdownAttemptResult = nil
+
+        let validationOperation = repositoryValidationOperation
+        repositoryValidationOperation = nil
+        validationOperation?.task.cancel()
+        if let validationOperation {
+            _ = await validationOperation.task.result
+        }
+
+        let owners = detachAllOwners()
+        let promotionOperation = authenticationPromotionOperation
+        authenticationPromotionOperation = nil
         let priorCleanupError = await retryPendingCleanupOwners()
         let ownerCleanupError = await disposeOwners(
-            session: sessionOwner,
-            authentication: owner,
-            candidate: candidate
+            session: owners.session,
+            authentication: owners.authentication,
+            candidate: owners.candidate
         )
-        if priorCleanupError == nil, ownerCleanupError == nil {
+        var promotionCleanupError: (any Error)?
+        if let promotionOperation {
+            if case let .success(promotion) = await promotionOperation.task.result {
+                do { try await disposeAuthVerified(promotion.owner) }
+                catch { promotionCleanupError = error }
+            }
+        }
+        let succeeded: Bool
+        if priorCleanupError == nil, ownerCleanupError == nil, promotionCleanupError == nil {
             do {
-            try await dependencies.persistence.close()
-            lifecycle = .unloaded
+                try await dependencies.persistence.close()
+                lifecycle = .unloaded
+                succeeded = true
             } catch {
                 lifecycle = .failed(String(describing: error))
                 issue = databaseIssue(error)
+                succeeded = false
             }
         } else {
             cleanupSuccessLifecycle = .unloaded
             lifecycle = .cleanupRequired
-            issue = cleanupIssue(priorCleanupError ?? ownerCleanupError!)
+            issue = cleanupIssue(priorCleanupError ?? ownerCleanupError ?? promotionCleanupError!)
+            succeeded = false
         }
+        shutdownInProgress = false
+        shutdownSucceeded = succeeded
+        lastShutdownAttemptResult = succeeded
+        let waiters = shutdownWaiters
+        shutdownWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        return succeeded
     }
 }
 
 // MARK: - Runtime preparation and replay
 
 private extension SessionModel {
-    private func prepareRuntime(executable: VibeExecutable, cwd: URL) async throws -> ActiveRuntime {
-        let authSnapshot = try await ensureAuthentication(executable: executable, requireReady: true)
-        authentication = .status(authSnapshot.status)
+    func validateRepository(_ url: URL) async throws -> CanonicalRepository {
+        try ensureOperational()
+        guard repositoryValidationOperation == nil else {
+            throw SessionModelError.invalidLifecycle(
+                expected: "no repository validation already in progress",
+                actual: lifecycle
+            )
+        }
 
-        let owner = dependencies.makeRuntime(executable, cwd)
-        let started = try await owner.start()
-        let active = ActiveRuntime(
-            id: dependencies.makeUUID(),
-            owner: owner,
-            generation: started.generation,
-            sessionID: nil
-        )
-        activeRuntime = active
-        startConsumers(for: active)
+        let id = UUID()
+        let task = Task { try await dependencies.validateRepository(url) }
+        repositoryValidationOperation = .init(id: id, task: task)
+        defer {
+            if repositoryValidationOperation?.id == id {
+                repositoryValidationOperation = nil
+            }
+        }
+
+        let repository = try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        try ensureOperational()
+        return repository
+    }
+
+    func ensureOperational() throws {
+        guard !isShuttingDown else { throw SessionModelError.shuttingDown }
+    }
+
+    func beginCurrentAuthenticationOperation() throws -> SessionLifecycle {
+        try ensureOperational()
+        guard !hasPendingCleanup else { throw SessionModelError.cleanupOutstanding }
+        let priorLifecycle = lifecycle
+        switch priorLifecycle {
+        case .unloaded, .idle, .reloadRequired, .failed:
+            lifecycle = .validatingExecutable
+            return priorLifecycle
+        default:
+            throw SessionModelError.invalidLifecycle(
+                expected: "Unloaded, Idle, Reload Required, or Failed",
+                actual: priorLifecycle
+            )
+        }
+    }
+
+    func finishCurrentAuthenticationOperation(
+        priorLifecycle: SessionLifecycle,
+        status: VibeAuthenticationStatus
+    ) {
+        guard !isShuttingDown else { return }
+        if status.isAuthenticated == true {
+            if issue?.kind == .authenticationRequired { issue = nil }
+            lifecycle = isFailed(priorLifecycle) ? .unloaded : priorLifecycle
+        } else {
+            lifecycle = priorLifecycle
+            issue = runtimeIssue(SessionModelError.authenticationRequired)
+        }
+    }
+
+    func finishFailedCurrentAuthenticationOperation(
+        priorLifecycle: SessionLifecycle,
+        error: any Error
+    ) {
+        guard !isShuttingDown else { return }
+        if hasPendingCleanup {
+            cleanupSuccessLifecycle = isFailed(priorLifecycle) ? .unloaded : priorLifecycle
+            lifecycle = .cleanupRequired
+            issue = cleanupIssue(error)
+        } else {
+            lifecycle = priorLifecycle
+        }
+    }
+
+    private func prepareRuntime(executable: VibeExecutable, cwd: URL) async throws -> ActiveRuntime {
+        try ensureOperational()
+        let authSnapshot = try await ensureAuthentication(executable: executable, requireReady: true)
+        try ensureOperational()
+        authentication = .status(authSnapshot.status)
+        let active = try await startRuntimeOwner(executable: executable, cwd: cwd)
 
         do {
-            let trustStatus = try await owner.repositoryTrustStatus(cwd: cwd)
+            let trustStatus = try await active.owner.repositoryTrustStatus(cwd: cwd)
+            try ensureOperational()
             guard activeRuntime?.id == active.id else { throw SessionModelError.staleRuntime }
             trust = .status(trustStatus)
             guard trustStatus.state == .trusted else {
                 let staleOwner = invalidateRuntime(clearPresentation: true)
                 try await stopVerified(staleOwner)
+                try ensureOperational()
                 trust = .status(trustStatus)
                 throw SessionModelError.repositoryTrustRequired
             }
@@ -1025,17 +1410,49 @@ private extension SessionModel {
         }
     }
 
+    private func startRuntimeOwner(executable: VibeExecutable, cwd: URL) async throws -> ActiveRuntime {
+        try ensureOperational()
+        let owner = dependencies.makeRuntime(executable, cwd)
+        provisionalRuntimeOwner = owner
+        do {
+            let started = try await owner.start()
+            try ensureOperational()
+            guard provisionalRuntimeOwner != nil else { throw SessionModelError.staleRuntime }
+            provisionalRuntimeOwner = nil
+            let active = ActiveRuntime(
+                id: dependencies.makeUUID(),
+                owner: owner,
+                generation: started.generation,
+                sessionID: nil
+            )
+            activeRuntime = active
+            startConsumers(for: active)
+            return active
+        } catch let startError {
+            provisionalRuntimeOwner = nil
+            if !isShuttingDown {
+                try await runRuntimeCleanup(owner: owner, retry: false)
+            }
+            throw startError
+        }
+    }
+
     func ensureAuthentication(
         executable: VibeExecutable,
         requireReady: Bool
     ) async throws -> VibeAuthenticationSnapshot {
         if authOwnerExecutablePath != executable.url.path {
             if let authOwner { try await disposeAuthVerified(authOwner) }
+            try ensureOperational()
             authOwner = dependencies.makeAuthenticationOwner(executable)
             authOwnerExecutablePath = executable.url.path
+            currentAuthenticationAttempt = nil
         }
         guard let authOwner else { throw SessionModelError.authenticationRequired }
         let snapshot = try await authOwner.refresh()
+        try ensureOperational()
+        currentAuthenticationAttempt = await authOwner.pendingDelegatedAuthentication()
+        try ensureOperational()
         if requireReady, snapshot.status.isAuthenticated != true {
             authentication = .status(snapshot.status)
             throw SessionModelError.authenticationRequired
@@ -1044,14 +1461,20 @@ private extension SessionModel {
     }
 
     func reconcileCurrentAuthentication() async {
+        guard !isShuttingDown else { return }
         guard let authOwner else {
             authentication = .unknown
+            currentAuthenticationAttempt = nil
             return
         }
+        currentAuthenticationAttempt = await authOwner.pendingDelegatedAuthentication()
+        guard !isShuttingDown else { return }
         do {
             let snapshot = try await authOwner.refresh()
+            guard !isShuttingDown else { return }
             authentication = .status(snapshot.status)
         } catch {
+            guard !isShuttingDown else { return }
             authentication = .unknown
         }
     }
@@ -1078,13 +1501,17 @@ private extension SessionModel {
             sessionID: metadata.thread.vibeSessionID,
             cwd: URL(filePath: metadata.environment.cwd, directoryHint: .isDirectory)
         )
+        try ensureOperational()
         guard activeRuntime?.id == runtimeID else { throw SessionModelError.staleRuntime }
         try bindAndValidate(result.barrier, runtimeID: runtimeID)
         try await waitForBarrier(result.barrier, runtimeID: runtimeID)
+        try ensureOperational()
         // Drain receive-loop work already queued on the main actor, then ask the runtime for its
         // authoritative health before publishing staged history.
         await Task.yield()
+        try ensureOperational()
         if let failure = await active.owner.failure() { throw failure }
+        try ensureOperational()
         if let failure = loadContext?.failure { throw failure }
 
         let options = try decodeConfigurationOptions(result.configurationOptions)
@@ -1139,6 +1566,7 @@ private extension SessionModel {
     func waitForBarrier(_ barrier: ReplayBarrier, runtimeID: UUID) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while ContinuousClock.now < deadline {
+            try ensureOperational()
             guard let context = loadContext, context.runtimeID == runtimeID else {
                 throw SessionModelError.staleRuntime
             }
@@ -1275,6 +1703,28 @@ private extension SessionModel {
 // MARK: - Disposal, failure, and presentation helpers
 
 private extension SessionModel {
+    func detachAllOwners() -> (
+        session: (any SessionRuntime)?,
+        authentication: (any SessionAuthenticationOwner)?,
+        candidate: (any SessionAuthenticationCandidate)?
+    ) {
+        let session = invalidateRuntime(clearPresentation: true) ?? provisionalRuntimeOwner
+        provisionalRuntimeOwner = nil
+
+        let authentication = authOwner
+        authOwner = nil
+        authOwnerExecutablePath = nil
+        currentAuthenticationAttempt = nil
+
+        let candidate = candidateContext?.owner ?? provisionalCandidateOwner
+        candidateContext = nil
+        provisionalCandidateOwner = nil
+        executableCandidate = nil
+        self.authentication = .unknown
+
+        return (session, authentication, candidate)
+    }
+
     func invalidateRuntime(
         clearPresentation: Bool,
         keepKnownGood: Bool = false
@@ -1308,35 +1758,17 @@ private extension SessionModel {
             if hasPendingCleanup { throw SessionModelError.cleanupOutstanding }
             return
         }
-        do {
-            try verifyCleanup(await owner.stop())
-            pendingRuntimeCleanup = nil
-        } catch {
-            pendingRuntimeCleanup = owner
-            throw error
-        }
+        try await runRuntimeCleanup(owner: owner, retry: false)
     }
 
     func disposeAuthVerified(_ owner: (any SessionAuthenticationOwner)?) async throws {
         guard let owner else { return }
-        do {
-            try verifyCleanup(try await owner.dispose())
-            pendingAuthCleanup = nil
-        } catch {
-            pendingAuthCleanup = owner
-            throw error
-        }
+        try await runAuthCleanup(owner: owner, retry: false)
     }
 
     func disposeCandidateVerified(_ owner: (any SessionAuthenticationCandidate)?) async throws {
         guard let owner else { return }
-        do {
-            try verifyCleanup(try await owner.dispose())
-            pendingCandidateCleanup = nil
-        } catch {
-            pendingCandidateCleanup = owner
-            throw error
-        }
+        try await runCandidateCleanup(owner: owner, retry: false)
     }
 
     func disposeOwners(
@@ -1357,30 +1789,108 @@ private extension SessionModel {
     func retryPendingCleanupOwners() async -> (any Error)? {
         var firstError: (any Error)?
         if let owner = pendingRuntimeCleanup {
-            do {
-                try verifyCleanup(try await owner.retryCleanup())
-                pendingRuntimeCleanup = nil
-            } catch {
-                firstError = firstError ?? error
-            }
+            do { try await runRuntimeCleanup(owner: owner, retry: true) }
+            catch { firstError = firstError ?? error }
         }
         if let owner = pendingAuthCleanup {
-            do {
-                try verifyCleanup(try await owner.retryCleanup())
-                pendingAuthCleanup = nil
-            } catch {
-                firstError = firstError ?? error
-            }
+            do { try await runAuthCleanup(owner: owner, retry: true) }
+            catch { firstError = firstError ?? error }
         }
         if let owner = pendingCandidateCleanup {
-            do {
-                try verifyCleanup(try await owner.retryCleanup())
-                pendingCandidateCleanup = nil
-            } catch {
-                firstError = firstError ?? error
-            }
+            do { try await runCandidateCleanup(owner: owner, retry: true) }
+            catch { firstError = firstError ?? error }
         }
         return firstError
+    }
+
+    /// Coalesces every waiter onto the same in-flight runtime cleanup task.
+    /// A retry task is created only after the previous attempt completed and
+    /// left the verified owner retained in `pendingRuntimeCleanup`.
+    func runRuntimeCleanup(owner: any SessionRuntime, retry: Bool) async throws {
+        let operation: CleanupOperation
+        if let existing = runtimeCleanupOperation {
+            operation = existing
+        } else {
+            pendingRuntimeCleanup = owner
+            let id = dependencies.makeUUID()
+            let task = Task<ProcessCleanupReport?, any Error> {
+                if retry {
+                    return try await owner.retryCleanup()
+                }
+                return await owner.stop()
+            }
+            operation = .init(id: id, task: task)
+            runtimeCleanupOperation = operation
+        }
+
+        let result = await operation.task.result
+        let ownsSlot = runtimeCleanupOperation?.id == operation.id
+        if ownsSlot { runtimeCleanupOperation = nil }
+        do {
+            try verifyCleanup(try result.get())
+            if ownsSlot { pendingRuntimeCleanup = nil }
+        } catch {
+            if ownsSlot { pendingRuntimeCleanup = owner }
+            throw error
+        }
+    }
+
+    func runAuthCleanup(owner: any SessionAuthenticationOwner, retry: Bool) async throws {
+        let operation: CleanupOperation
+        if let existing = authCleanupOperation {
+            operation = existing
+        } else {
+            pendingAuthCleanup = owner
+            let id = dependencies.makeUUID()
+            let task = Task<ProcessCleanupReport?, any Error> {
+                if retry {
+                    return try await owner.retryCleanup()
+                }
+                return try await owner.dispose()
+            }
+            operation = .init(id: id, task: task)
+            authCleanupOperation = operation
+        }
+
+        let result = await operation.task.result
+        let ownsSlot = authCleanupOperation?.id == operation.id
+        if ownsSlot { authCleanupOperation = nil }
+        do {
+            try verifyCleanup(try result.get())
+            if ownsSlot { pendingAuthCleanup = nil }
+        } catch {
+            if ownsSlot { pendingAuthCleanup = owner }
+            throw error
+        }
+    }
+
+    func runCandidateCleanup(owner: any SessionAuthenticationCandidate, retry: Bool) async throws {
+        let operation: CleanupOperation
+        if let existing = candidateCleanupOperation {
+            operation = existing
+        } else {
+            pendingCandidateCleanup = owner
+            let id = dependencies.makeUUID()
+            let task = Task<ProcessCleanupReport?, any Error> {
+                if retry {
+                    return try await owner.retryCleanup()
+                }
+                return try await owner.dispose()
+            }
+            operation = .init(id: id, task: task)
+            candidateCleanupOperation = operation
+        }
+
+        let result = await operation.task.result
+        let ownsSlot = candidateCleanupOperation?.id == operation.id
+        if ownsSlot { candidateCleanupOperation = nil }
+        do {
+            try verifyCleanup(try result.get())
+            if ownsSlot { pendingCandidateCleanup = nil }
+        } catch {
+            if ownsSlot { pendingCandidateCleanup = owner }
+            throw error
+        }
     }
 
     func verifyCleanup(_ report: ProcessCleanupReport?) throws {
@@ -1391,10 +1901,12 @@ private extension SessionModel {
     }
 
     func failLoadOrPreparation(_ error: any Error, preserveKnownGood: Bool) async {
+        guard !isShuttingDown else { return }
         let blockedTrust = trust
         let owner = invalidateRuntime(clearPresentation: true, keepKnownGood: preserveKnownGood)
         do {
             try await stopVerified(owner)
+            guard !isShuttingDown else { return }
             if preserveKnownGood {
                 lifecycle = .reloadRequired
             } else {
@@ -1407,6 +1919,7 @@ private extension SessionModel {
             }
             issue = runtimeIssue(error)
         } catch {
+            guard !isShuttingDown else { return }
             cleanupSuccessLifecycle = preserveKnownGood ? .reloadRequired : .unloaded
             lifecycle = .cleanupRequired
             issue = cleanupIssue(error)
@@ -1414,6 +1927,7 @@ private extension SessionModel {
     }
 
     func handleRuntimeFailure(_ error: any Error, preserveKnownGood: Bool) async {
+        guard !isShuttingDown else { return }
         guard !handlingRuntimeFailure else { return }
         handlingRuntimeFailure = true
         defer { handlingRuntimeFailure = false }

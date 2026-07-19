@@ -25,6 +25,7 @@ enum ConfigurationGate {
                 "reason": .string("existing_journal"),
                 "started": .bool(true),
             ])
+            try await reconcileRecordedWorker(journalURL: journalURL)
             let existing = try ConfigurationJournalStore.load(from: journalURL)
             try await restore(journal: existing, journalURL: journalURL)
             try ConfigurationJournalStore.remove(journalURL)
@@ -58,28 +59,51 @@ enum ConfigurationGate {
             "containsTranscript": .bool(false),
         ])
 
-        var workerError: (any Error)?
+        let worker = ConfigurationWorkerController(
+            journalURL: journalURL,
+            timeout: workerTimeout
+        )
         do {
-            try await runWorker(journalURL: journalURL, timeout: workerTimeout)
-        } catch {
-            workerError = error
+            try await ConfigurationGateSupervisor.run(
+                worker: {
+                    try await worker.run()
+                },
+                cleanupWorker: {
+                    try await worker.cleanup()
+                },
+                restoreOriginals: {
+                    try await restore(journal: journal, journalURL: journalURL)
+                },
+                commitRestoration: {
+                    try ConfigurationJournalStore.remove(journalURL)
+                    ProbeOutput.emit([
+                        "record": .string("configuration_restoration"),
+                        "originalModelReobserved": .bool(true),
+                        "originalThinkingReobserved": .bool(true),
+                        "journalRetained": .bool(false),
+                    ])
+                }
+            )
+        } catch let supervisorError as ConfigurationGateSupervisorError {
+            switch supervisorError {
+            case let .cleanup(error):
+                let survivorCount = (error as? ConfigurationWorkerCleanupIncomplete)?.survivors.count ?? 0
+                ProbeOutput.emit([
+                    "record": .string("configuration_worker_cleanup"),
+                    "status": .string("blocked"),
+                    "survivorCount": .integer(Int64(survivorCount)),
+                    "journalRetained": .bool(true),
+                    "error": .string(String(describing: error)),
+                ])
+                throw ProbeError.restoration(
+                    "configuration worker cleanup remains incomplete; restoration was not started and the recovery journal is retained at \(journalURL.path)"
+                )
+            case let .restoration(error):
+                await reportRestorationFailure(journal: journal, error: error)
+                throw ProbeError.restoration("\(error); recovery journal retained at \(journalURL.path)")
+            }
         }
 
-        do {
-            try await restore(journal: journal, journalURL: journalURL)
-            try ConfigurationJournalStore.remove(journalURL)
-            ProbeOutput.emit([
-                "record": .string("configuration_restoration"),
-                "originalModelReobserved": .bool(true),
-                "originalThinkingReobserved": .bool(true),
-                "journalRetained": .bool(false),
-            ])
-        } catch {
-            await reportRestorationFailure(journal: journal, error: error)
-            throw ProbeError.restoration("\(error); recovery journal retained at \(journalURL.path)")
-        }
-
-        if let workerError { throw workerError }
         ProbeOutput.emit([
             "record": .string("configuration_gate"),
             "status": .string("passed"),
@@ -172,7 +196,7 @@ enum ConfigurationGate {
         do {
             try await runtime.requireReady()
             let loaded = try await runtime.load(sessionID: sessionID)
-            let options = loaded.configurationOptions.compactMap(ConfigurationOption.init)
+            let options = loaded.configurationOptions.compactMap(VibeConfigurationOption.init)
             guard options.count == loaded.configurationOptions.count else {
                 throw ProbeError.compatibility("a configuration option had an unsupported shape")
             }
@@ -185,7 +209,7 @@ enum ConfigurationGate {
     }
 
     private static func setAndVerify(
-        option: ConfigurationOption,
+        option: VibeConfigurationOption,
         value: JSONValue,
         executable: VibeExecutable,
         cwd: URL,
@@ -204,7 +228,7 @@ enum ConfigurationGate {
                 "configId": .string(option.id),
                 "value": value,
             ]
-            if option.type == "boolean" { params["type"] = .string("boolean") }
+            if option.kind == .boolean { params["type"] = .string("boolean") }
             let requestParameters = JSONValue.object(params)
             _ = try await withTimeout(.seconds(30), operationName: "session/set_config_option") {
                 try await runtime.transport.request(
@@ -299,82 +323,132 @@ enum ConfigurationGate {
         ]
     }
 
-    private static func runWorker(journalURL: URL, timeout: Duration) async throws {
-        let process = Process()
+    private static func reconcileRecordedWorker(journalURL: URL) async throws {
+        let journal = try ConfigurationJournalStore.load(from: journalURL)
+        let recorded = Set(journal.workerProcessIdentities ?? [])
+        guard !recorded.isEmpty else { return }
+
+        var survivors: Set<ProcessIdentity> = []
+        for identity in recorded where ProcessInspector.isAlive(identity) {
+            let tracker = ProcessTreeTerminator(root: identity)
+            _ = await tracker.refresh()
+            let cleanup = await Task.detached(priority: .userInitiated) {
+                await tracker.terminate(
+                    gracePeriod: .seconds(2),
+                    rescanInterval: .milliseconds(25),
+                    killConfirmationPeriod: .seconds(1)
+                )
+            }.value
+            survivors.formUnion(cleanup.survivors)
+        }
+        survivors = Set(survivors.filter(ProcessInspector.isAlive))
+        try ConfigurationJournalStore.updateWorkerIdentities(survivors, at: journalURL)
+        guard survivors.isEmpty else {
+            throw ConfigurationWorkerCleanupIncomplete(survivors: survivors)
+        }
+    }
+}
+
+private final class ConfigurationWorkerController: @unchecked Sendable {
+    private let journalURL: URL
+    private let timeout: Duration
+    private let process: Process
+    private let cancellation = SupervisorCancellation()
+    private var tracker: ProcessTreeTerminator?
+
+    init(journalURL: URL, timeout: Duration) {
+        self.journalURL = journalURL
+        self.timeout = timeout
+        process = Process()
         process.executableURL = canonicalURL(CommandLine.arguments[0])
         process.arguments = ["config-worker", "--journal", journalURL.path]
         process.currentDirectoryURL = URL(filePath: FileManager.default.currentDirectoryPath)
         process.standardOutput = FileHandle.standardOutput
         process.standardError = FileHandle.standardError
+    }
+
+    func run() async throws {
         try process.run()
 
         guard let identity = ProcessInspector.snapshot(pid: process.processIdentifier)?.identity else {
-            process.terminate()
             throw ProbeError.process("could not establish the configuration worker identity")
         }
         let tracker = ProcessTreeTerminator(root: identity)
-        _ = await tracker.refresh()
-        let cancellation = SupervisorCancellation()
+        self.tracker = tracker
+        var recordedIdentities = await tracker.refresh()
+        var workerBookkeepingError: (any Error)?
+        do {
+            try ConfigurationJournalStore.updateWorkerIdentities(recordedIdentities, at: journalURL)
+        } catch {
+            workerBookkeepingError = error
+        }
+
         let signals = SupervisorSignals(cancellation: cancellation, process: process)
         signals.start()
         defer { signals.stop(resetHandlers: false) }
 
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
-        var timedOut = false
-        while process.isRunning, clock.now < deadline, !cancellation.isCancelled {
-            _ = await tracker.refresh()
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        if process.isRunning {
-            timedOut = clock.now >= deadline
-            let cleanup = await tracker.terminate(gracePeriod: .seconds(2))
-            if !cleanup.survivors.isEmpty {
-                throw ProbeError.process("configuration worker cleanup left \(cleanup.survivors.count) survivor(s)")
+        while workerBookkeepingError == nil,
+              process.isRunning,
+              clock.now < deadline,
+              !cancellation.isCancelled,
+              !Task.isCancelled
+        {
+            let current = await tracker.refresh()
+            if current != recordedIdentities {
+                recordedIdentities = current
+                do {
+                    try ConfigurationJournalStore.updateWorkerIdentities(current, at: journalURL)
+                } catch {
+                    workerBookkeepingError = error
+                }
             }
-        } else {
-            let cleanup = await tracker.terminate(gracePeriod: .milliseconds(10))
-            if !cleanup.survivors.isEmpty {
-                throw ProbeError.process("configuration worker left \(cleanup.survivors.count) descendant(s)")
-            }
+            try? await Task.sleep(for: .milliseconds(100))
         }
-        process.waitUntilExit()
 
-        if timedOut { throw ProbeError.timeout("configuration worker") }
-        if cancellation.isCancelled { throw CancellationError() }
+        if let workerBookkeepingError { throw workerBookkeepingError }
+        if process.isRunning, clock.now >= deadline {
+            throw ProbeError.timeout("configuration worker")
+        }
+        if cancellation.isCancelled || Task.isCancelled { throw CancellationError() }
         guard process.terminationReason == .exit, process.terminationStatus == 0 else {
             throw ProbeError.process(
                 "configuration worker exited with status \(process.terminationStatus)"
             )
         }
     }
+
+    func cleanup() async throws {
+        guard let tracker else {
+            // `Process.run()` can fail before a child exists. There is nothing to clean up in
+            // that case, so restoration remains safe. A live child without a verified identity
+            // is different: stop the known root and retain the journal because descendants
+            // cannot be proven absent.
+            guard process.isRunning else { return }
+            process.terminate()
+            throw ProbeError.process(
+                "configuration worker cleanup could not verify the worker process identity"
+            )
+        }
+
+        _ = await tracker.refresh()
+        let cleanup = await tracker.terminate(
+            gracePeriod: .seconds(2),
+            rescanInterval: .milliseconds(25),
+            killConfirmationPeriod: .seconds(1)
+        )
+        if !cleanup.survivors.isEmpty {
+            try? ConfigurationJournalStore.updateWorkerIdentities(cleanup.survivors, at: journalURL)
+            throw ConfigurationWorkerCleanupIncomplete(survivors: cleanup.survivors)
+        }
+        try ConfigurationJournalStore.updateWorkerIdentities([], at: journalURL)
+        process.waitUntilExit()
+    }
 }
 
-enum ConfigurationJournalStore {
-    static func save(_ journal: ConfigurationJournal, to url: URL) throws {
-        try writeJSON(journal, to: url)
-        let handle = try FileHandle(forWritingTo: url)
-        try handle.synchronize()
-        try handle.close()
-        synchronizeDirectory(url.deletingLastPathComponent())
-    }
-
-    static func load(from url: URL) throws -> ConfigurationJournal {
-        try loadJSON(ConfigurationJournal.self, from: url)
-    }
-
-    static func remove(_ url: URL) throws {
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try FileManager.default.removeItem(at: url)
-        synchronizeDirectory(url.deletingLastPathComponent())
-    }
-
-    private static func synchronizeDirectory(_ url: URL) {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_DIRECTORY)
-        guard descriptor >= 0 else { return }
-        _ = fsync(descriptor)
-        _ = Darwin.close(descriptor)
-    }
+private struct ConfigurationWorkerCleanupIncomplete: Error, Sendable {
+    let survivors: Set<ProcessIdentity>
 }
 
 private final class SupervisorCancellation: @unchecked Sendable {

@@ -1,17 +1,17 @@
 <p align="center">
-  <img src="Sources/LeChaton/Resources/Assets.xcassets/AppIcon.appiconset/icon_512x512@2x.png" width="180" alt="Mac Chaton app icon">
+  <img src="Sources/LeChaton/Resources/Assets.xcassets/AppIcon.appiconset/icon_512x512@2x.png" width="180" alt="LeChaton app icon">
 </p>
 
-<h1 align="center">Mac Chaton</h1>
+<h1 align="center">LeChaton</h1>
 
-Mac Chaton is a native macOS client for [Mistral Vibe](https://docs.mistral.ai/vibe/overview), built around the Agent Client Protocol (ACP). The hackathon prototype focuses on safely restoring one local coding thread across app and Vibe process restarts without copying conversation content into its own database.
+LeChaton is a native macOS client for [Mistral Vibe](https://docs.mistral.ai/vibe/overview), built around the Agent Client Protocol (ACP). The hackathon prototype focuses on safely restoring one local coding thread across app and Vibe process restarts without copying conversation content into its own database.
 
 > [!IMPORTANT]
-> Mac Chaton is under active hackathon development. You can build it from source today, but a signed and notarized download is not available yet.
+> LeChaton is under active hackathon development. You can build it from source today, but a signed and notarized download is not available yet.
 
 [View GitHub releases](../../releases)
 
-![Mac Chaton workspace showing the start-a-thread screen](docs/assets/mac-chaton-workspace.png)
+![LeChaton workspace showing the start-a-thread screen](docs/assets/mac-chaton-workspace.png)
 
 ## Prototype scope
 
@@ -36,7 +36,7 @@ The compatibility gate for the supported Vibe release has passed. Its sanitized,
 - Mistral Vibe **2.21.0**, including the `vibe-acp` executable.
 - A non-bare local Git worktree with a valid `HEAD` commit.
 
-Mac Chaton intentionally validates the exact Vibe version instead of assuming compatibility with other releases. Install Vibe using the [official Mistral instructions](https://docs.mistral.ai/getting-started/quickstarts/vibe-code/install-cli), then confirm the installed version:
+LeChaton intentionally validates the exact Vibe version instead of assuming compatibility with other releases. Install Vibe using the [official Mistral instructions](https://docs.mistral.ai/getting-started/quickstarts/vibe-code/install-cli), then confirm the installed version:
 
 ```sh
 vibe --version
@@ -72,14 +72,14 @@ script/build_and_run.sh --telemetry
 ## First run
 
 1. Make sure Vibe 2.21.0 is installed and available as `vibe-acp`.
-2. Launch Mac Chaton and select a local Git repository when creating a thread.
+2. Launch LeChaton and select a local Git repository when creating a thread.
 3. Complete Vibe's browser sign-in if requested.
 4. Review the repository-trust choices supplied by Vibe.
 5. Review every tool permission before allowing it.
 
-Mac Chaton looks for `vibe-acp` in the saved user-selected location and common installation locations. If it cannot find a compatible executable, it presents the native file picker.
+LeChaton looks for `vibe-acp` in the saved user-selected location and common installation locations. If it cannot find a compatible executable, it presents the native file picker.
 
-Authentication credentials, repository trust decisions, and conversation content remain owned by Vibe. Mac Chaton stores only the project and thread identifiers, the local environment, the selected executable path, and the selected-thread metadata needed for restoration.
+Authentication credentials, repository trust decisions, and conversation content remain owned by Vibe. LeChaton stores only the project and thread identifiers, the local environment, the selected executable path, and the selected-thread metadata needed for restoration.
 
 > [!WARNING]
 > A Vibe session can inspect and modify the repository or run commands when you grant the corresponding permission. Use a repository you are comfortable testing with and read permission prompts carefully.
@@ -96,7 +96,7 @@ The live ACP probe is deliberately separate and opt-in because it uses a real Vi
 
 ## Architecture
 
-Mac Chaton keeps the native app, reusable runtime, live compatibility probe, and deterministic test process behind explicit target boundaries. The codebase still uses its original internal target identifiers:
+LeChaton keeps the native app, reusable runtime, live compatibility probe, and deterministic test process behind explicit target boundaries:
 
 | Target | Responsibility |
 | --- | --- |

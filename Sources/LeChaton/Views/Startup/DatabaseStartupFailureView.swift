@@ -11,7 +11,14 @@ struct DatabaseStartupFailureView: View {
         ContentUnavailableView {
             Label(failure.title, systemImage: icon)
         } description: {
-            Text(failure.message)
+            VStack(spacing: 8) {
+                Text(failure.message)
+                if let backupURL = failure.recoveryBackupURL {
+                    Text(backupURL.path)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+            }
         } actions: {
             HStack(spacing: 10) {
                 switch failure.kind {
@@ -38,6 +45,11 @@ struct DatabaseStartupFailureView: View {
                         .tint(LeChatonTheme.orange)
                         .foregroundStyle(LeChatonTheme.onAccent)
                     Button("Reveal Database") { container.revealDatabase() }
+                    if let backupURL = failure.recoveryBackupURL {
+                        Button("Reveal Recovery Backup") {
+                            container.revealRecoveryBackup(backupURL)
+                        }
+                    }
                     Button("Export Diagnostic") { container.exportStartupDiagnostic() }
                     Button("Quit") { NSApp.terminate(nil) }
                 }

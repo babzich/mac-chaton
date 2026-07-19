@@ -64,8 +64,10 @@ private struct RuntimeStatusView: View {
 
             Label(authenticationLabel, systemImage: authenticationIcon)
                 .foregroundStyle(authenticationColor)
+                .help(authenticationHelp)
             Label(trustLabel, systemImage: trustIcon)
                 .foregroundStyle(trustColor)
+                .help(trustHelp)
 
             if let activity = workspace.model.activity {
                 HStack(spacing: 7) {
@@ -84,14 +86,18 @@ private struct RuntimeStatusView: View {
 
     private var authenticationLabel: String {
         switch workspace.model.authentication {
-        case .unknown: "Authentication unknown"
+        case .unknown: "Authentication not checked"
         case let .status(status):
             switch status.state {
             case .authenticated: "Authenticated"
             case .unauthenticated: "Sign-in required"
-            case .unknown: "Authentication unknown"
+            case .unknown: "Authentication not checked"
             }
         }
+    }
+
+    private var authenticationHelp: String {
+        "LeChaton does not start Vibe at launch. Resume a Thread or use Refresh Status in Settings to check authentication."
     }
 
     private var authenticationIcon: String {
@@ -112,14 +118,18 @@ private struct RuntimeStatusView: View {
 
     private var trustLabel: String {
         switch workspace.model.trust {
-        case .unknown: "Repository trust unknown"
+        case .unknown: "Repository trust not checked"
         case let .status(status):
             switch status.state {
             case .trusted: "Repository trusted"
             case .untrusted: "Trust required in Vibe"
-            case .unknown: "Repository trust unknown"
+            case .unknown: "Repository trust not checked"
             }
         }
+    }
+
+    private var trustHelp: String {
+        "Repository trust is checked only when LeChaton starts or resumes a Vibe session."
     }
 
     private var trustIcon: String {

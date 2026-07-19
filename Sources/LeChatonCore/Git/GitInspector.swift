@@ -812,7 +812,7 @@ private func readBoundedRegularFile(_ url: URL, maximumBytes: Int) throws -> Dat
     return result
 }
 
-private struct GitCommandResult: Sendable {
+struct GitCommandResult: Sendable {
     let stdout: Data
     let stderr: Data
     let exitCode: Int32
@@ -863,7 +863,11 @@ private final class GitOutputCollector: @unchecked Sendable {
     }
 }
 
-private struct GitCommandRunner: Sendable {
+/// Shared bounded subprocess boundary for read-only Git commands.
+///
+/// Repository validation and inspection intentionally use the same timeout,
+/// output-draining, cancellation, and verified process-tree cleanup behavior.
+struct GitCommandRunner: Sendable {
     let executableURL: URL
 
     func run(

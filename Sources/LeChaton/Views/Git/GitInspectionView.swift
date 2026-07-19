@@ -34,11 +34,25 @@ struct GitInspectionView: View {
             }
 
             if workspace.model.lifecycle != .idle {
-                ContentUnavailableView(
-                    "Resume to inspect changes",
-                    systemImage: "pause.circle",
-                    description: Text("The Git baseline is captured after a successful Resume or New Thread.")
-                )
+                ContentUnavailableView {
+                    Label(
+                        workspace.model.canResume ? "Resume to inspect changes" : "Git inspection unavailable",
+                        systemImage: workspace.model.canResume ? "pause.circle" : "hourglass"
+                    )
+                } description: {
+                    if workspace.model.canResume {
+                        Text("The Git baseline is captured after a successful Resume or New Thread.")
+                    } else {
+                        Text("Finish the current Thread activity before inspecting repository changes.")
+                    }
+                } actions: {
+                    if workspace.model.canResume {
+                        Button("Resume") { Task { await workspace.resume() } }
+                            .buttonStyle(.borderedProminent)
+                            .tint(LeChatonTheme.orange)
+                            .foregroundStyle(LeChatonTheme.onAccent)
+                    }
+                }
             } else if let errorMessage = workspace.git.errorMessage {
                 ContentUnavailableView {
                     Label("Git inspection failed", systemImage: "exclamationmark.triangle")
@@ -115,6 +129,11 @@ struct GitInspectionView: View {
             }
             .onAppear {
                 if selectedPath == nil { selectedPath = inspection.files.first?.status.path }
+            }
+            .onChange(of: inspection.files.map(\.status.path)) { _, paths in
+                if selectedPath == nil || !paths.contains(selectedPath ?? "") {
+                    selectedPath = paths.first
+                }
             }
         }
     }

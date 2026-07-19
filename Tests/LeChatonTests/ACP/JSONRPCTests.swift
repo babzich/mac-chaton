@@ -60,4 +60,38 @@ struct JSONRPCTests {
         #expect(notification.method == "future/event")
         #expect(notification.params?["answer"]?.intValue == 42)
     }
+
+    @Test("Permission requests require an actionable, fully identified option")
+    func permissionRequestRequiresAnAction() {
+        func request(options: [JSONValue]) -> IncomingACPRequest {
+            IncomingACPRequest(
+                id: .integer(1),
+                method: "session/request_permission",
+                params: .object([
+                    "sessionId": .string("session"),
+                    "toolCall": .object(["toolCallId": .string("tool")]),
+                    "options": .array(options),
+                ]),
+                metadata: nil
+            )
+        }
+
+        #expect(PermissionRequest(request(options: [])) == nil)
+        #expect(PermissionRequest(request(options: [
+            .object([
+                "optionId": .string(""),
+                "name": .string("Allow"),
+                "kind": .string("allow_once"),
+            ]),
+        ])) == nil)
+
+        let decoded = PermissionRequest(request(options: [
+            .object([
+                "optionId": .string("allow"),
+                "name": .string("Allow once"),
+                "kind": .string("allow_once"),
+            ]),
+        ]))
+        #expect(decoded?.options.map(\.optionID) == ["allow"])
+    }
 }

@@ -1,4 +1,5 @@
 import AppKit
+import LeChatonCore
 import SwiftUI
 
 @main
@@ -8,7 +9,7 @@ struct LeChatonApp: App {
     @State private var container = ApplicationContainer()
 
     var body: some Scene {
-        Window("LeChaton", id: "workspace") {
+        Window("LeChaton", id: "main") {
             ApplicationRootView(container: container)
                 .frame(minWidth: 820, minHeight: 580)
                 .tint(LeChatonTheme.orange)
@@ -27,7 +28,7 @@ struct LeChatonApp: App {
                     createThreadFromCommand()
                 }
                 .keyboardShortcut("n")
-                .disabled(container.workspace?.model.selectedThread != nil)
+                .disabled(container.workspace?.canCreateThread != true)
             }
 
             CommandMenu("Thread") {
@@ -42,7 +43,6 @@ struct LeChatonApp: App {
                     guard let workspace = container.workspace else { return }
                     Task { await workspace.cancelPrompt() }
                 }
-                .keyboardShortcut(.escape, modifiers: [])
                 .disabled(container.workspace?.model.lifecycle != .prompting)
             }
         }
@@ -56,7 +56,7 @@ struct LeChatonApp: App {
 
     private func createThreadFromCommand() {
         guard let workspace = container.workspace,
-              workspace.model.selectedThread == nil,
+              workspace.canCreateThread,
               let repository = SystemPickers.chooseRepository()
         else { return }
         Task {

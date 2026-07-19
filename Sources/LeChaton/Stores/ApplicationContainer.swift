@@ -46,10 +46,17 @@ final class ApplicationContainer {
                 let result = try await Task.detached(priority: .userInitiated) {
                     try PersistenceStore.recoverFailedLocalMetadata()
                 }.value
+                guard !Task.isCancelled else {
+                    startTask = nil
+                    return
+                }
                 startupRecoveryBackupURL = result.backupDirectory
                 startTask = nil
                 start()
             } catch {
+                if case let PersistenceStoreError.resetRecreationFailed(backupDirectory, _) = error {
+                    startupRecoveryBackupURL = backupDirectory
+                }
                 startupState = .failed(DatabaseStartupFailure(error: error))
                 startTask = nil
             }
@@ -62,6 +69,10 @@ final class ApplicationContainer {
             ? locations.databaseFile
             : locations.databaseDirectory
         NSWorkspace.shared.activateFileViewerSelecting([target])
+    }
+
+    func revealRecoveryBackup(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     func exportStartupDiagnostic() {
@@ -96,11 +107,15 @@ final class ApplicationContainer {
     }
 
     func shutdown() async -> Bool {
-        startTask?.cancel()
+        // Startup and recovery can suspend on database work. Wait for the task to
+        // settle before inspecting owners so Cmd-Q cannot race a newly published
+        // store/workspace or terminate midway through recoverable reset.
+        let pendingStart = startTask
+        pendingStart?.cancel()
+        await pendingStart?.value
         startTask = nil
         if let workspace {
-            await workspace.shutdown()
-            return workspace.model.lifecycle != .cleanupRequired
+            return await workspace.shutdown()
         }
         if let store {
             do {

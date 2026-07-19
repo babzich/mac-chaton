@@ -6,6 +6,7 @@ struct ThreadCreationSheet: View {
     let onCancel: () -> Void
 
     @State private var title: String
+    @FocusState private var titleIsFocused: Bool
 
     init(
         draft: ThreadCreationDraft,
@@ -28,9 +29,11 @@ struct ThreadCreationSheet: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
                 .truncationMode(.middle)
+                .accessibilityLabel("Repository: \(draft.repositoryURL.path)")
 
             TextField("Thread title", text: $title)
                 .textFieldStyle(.roundedBorder)
+                .focused($titleIsFocused)
                 .accessibilityLabel("Thread title")
 
             if draft.mode == .replace {
@@ -58,5 +61,6 @@ struct ThreadCreationSheet: View {
         }
         .padding(24)
         .frame(width: 500)
+        .onAppear { titleIsFocused = true }
     }
 }

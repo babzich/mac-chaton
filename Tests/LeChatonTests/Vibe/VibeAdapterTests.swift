@@ -187,6 +187,33 @@ struct VibeAdapterTests {
         #expect(!ProcessInspector.isAlive(root))
     }
 
+    @Test("Candidate transfer refuses an owner whose final auth refresh is no longer ready")
+    func privateCandidateTransferRequiresFinalAuthentication() async throws {
+        let adapter = VibeAdapter()
+        let candidate = adapter.makeAuthenticationCandidate(
+            executable: try fakeVibeExecutable(),
+            neutralWorkingDirectory: repositoryURL,
+            processOptions: try fakeProcessOptions(scenario: "auth-drops-before-promotion")
+        )
+        let initial = try await candidate.refresh()
+        #expect(initial.status.state == .authenticated)
+        let root = try #require(await candidate.rootProcessIdentity())
+
+        do {
+            _ = try await candidate.takeValidatedOwner()
+            Issue.record("Expected final unauthenticated status to block promotion")
+        } catch let error as AuthCoordinatorError {
+            #expect(error == .authenticationRequiredAtPromotion)
+        }
+
+        // Failed promotion retains candidate ownership so the process can be
+        // deterministically disposed instead of leaking an unpublished owner.
+        #expect(await candidate.rootProcessIdentity() == root)
+        let report = try await candidate.dispose()
+        #expect(report?.survivors.isEmpty == true)
+        #expect(!ProcessInspector.isAlive(root))
+    }
+
     @Test("Configuration option models preserve supported and unknown kinds")
     func configurationOptionDecoding() throws {
         let select = try #require(VibeConfigurationOption(.object([
@@ -203,6 +230,17 @@ struct VibeAdapterTests {
         #expect(select.kind == .select)
         #expect(select.values == [.string("small"), .string("large")])
         #expect(select.alternateValue == .string("large"))
+
+        let singleValue = try #require(VibeConfigurationOption(.object([
+            "id": .string("single-model"),
+            "type": .string("select"),
+            "currentValue": .string("only"),
+            "options": .array([
+                .object(["value": .string("only")]),
+            ]),
+        ])))
+        #expect(singleValue.values == [.string("only")])
+        #expect(singleValue.alternateValue == nil)
 
         let boolean = try #require(VibeConfigurationOption(.object([
             "id": .string("enabled"),

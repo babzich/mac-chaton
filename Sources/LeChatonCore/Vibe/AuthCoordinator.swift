@@ -13,6 +13,7 @@ public enum AuthCoordinatorError: Error, Equatable, Sendable, CustomStringConver
     case attemptAlreadyPending(String)
     case noPendingAttempt
     case attemptMismatch(expected: String, received: String)
+    case authenticationRequiredAtPromotion
 
     public var description: String {
         switch self {
@@ -27,6 +28,8 @@ public enum AuthCoordinatorError: Error, Equatable, Sendable, CustomStringConver
         case .noPendingAttempt: "No delegated authentication attempt is pending"
         case let .attemptMismatch(expected, received):
             "Expected delegated authentication attempt \(expected), received \(received)"
+        case .authenticationRequiredAtPromotion:
+            "The executable candidate was no longer authenticated at promotion"
         }
     }
 }
@@ -378,6 +381,9 @@ actor VibeAuthenticationCandidate {
     func takeValidatedOwner() async throws -> (AuthCoordinator, VibeAuthenticationSnapshot) {
         guard let coordinator else { throw AuthCoordinatorError.runtimeInvalidated }
         let snapshot = try await coordinator.refresh()
+        guard snapshot.status.isAuthenticated == true else {
+            throw AuthCoordinatorError.authenticationRequiredAtPromotion
+        }
         guard self.coordinator === coordinator else {
             throw AuthCoordinatorError.runtimeInvalidated
         }

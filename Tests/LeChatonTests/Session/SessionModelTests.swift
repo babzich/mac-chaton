@@ -300,17 +300,65 @@ struct SessionModelTests {
         )
         await model.restoreLaunchMetadata()
         await model.resume()
+        await first.emitLiveUpdate(
+            sequence: 2,
+            payload: .plan(
+                id: "transient-plan",
+                entries: [.init(content: "Do not snapshot", priority: .high, status: .inProgress)],
+                metadata: nil
+            )
+        )
+        await waitUntil { model.sessionState.plan.isEmpty == false }
 
         await model.applyConfiguration(optionID: "model", value: .string("large"))
 
         #expect(model.lifecycle == .reloadRequired)
         #expect(model.sessionState.messages.isEmpty)
         #expect(model.knownGoodSnapshot?.state.messages.map(\.text) == ["Known good"])
+        #expect(model.knownGoodSnapshot?.state.plan.isEmpty == true)
+        #expect(model.knownGoodSnapshot?.state.planID == nil)
         #expect(model.configurationState == .reloadRequired(
             optionID: "model",
             requestedValue: .string("large")
         ))
         #expect(model.issue?.kind == .configurationReloadRequired)
+    }
+
+    @Test("A configuration response timeout enters Reload Required without claiming rollback")
+    func configurationResponseTimeout() async throws {
+        let repository = try TestRepository(name: "configuration-timeout")
+        defer { repository.remove() }
+        let metadata = makeMetadata(repositoryURL: repository.url)
+        let attempt = UUID()
+        let runtime = FakeSessionRuntime(
+            loadBehavior: .success(
+                attemptID: attempt,
+                events: [],
+                barrierAttemptID: attempt,
+                throughSequence: 0,
+                configurationOptions: [configurationOption(current: "small")]
+            ),
+            configurationError: ACPTransportError.responseTimedOut(
+                method: "session/set_config_option"
+            )
+        )
+        let model = makeRestorableModel(
+            metadata: metadata,
+            persistence: FakeSessionPersistence(metadata: metadata),
+            runtimes: [runtime]
+        )
+        await model.restoreLaunchMetadata()
+        await model.resume()
+
+        await model.applyConfiguration(optionID: "model", value: .string("large"))
+
+        #expect(model.lifecycle == .reloadRequired)
+        #expect(model.configurationState == .reloadRequired(
+            optionID: "model",
+            requestedValue: .string("large")
+        ))
+        #expect(model.issue?.kind == .configurationReloadRequired)
+        #expect(model.knownGoodSnapshot != nil)
     }
 
     @Test("Permissions stay FIFO and cancellation cannot trap an in-flight decision")
@@ -389,11 +437,196 @@ struct SessionModelTests {
         await model.unload()
         #expect(model.lifecycle == .cleanupRequired)
         #expect(model.hasPendingCleanup)
+        let cleanupIssue = model.issue
+
+        await model.removeSavedThread()
+        #expect(model.issue == cleanupIssue)
+        #expect(model.selectedThread == metadata)
+        #expect(model.lifecycle == .cleanupRequired)
 
         await model.retryCleanup()
         #expect(model.lifecycle == .unloaded)
         #expect(!model.hasPendingCleanup)
         #expect(await runtime.cleanupAttemptCount == 2)
+    }
+
+    @Test("Shutdown waits for cleanup already in flight")
+    func shutdownWaitsForInflightCleanup() async throws {
+        let repository = try TestRepository(name: "shutdown-cleanup-race")
+        defer { repository.remove() }
+        let metadata = makeMetadata(repositoryURL: repository.url)
+        let runtime = FakeSessionRuntime(holdCleanup: true)
+        let model = makeRestorableModel(
+            metadata: metadata,
+            persistence: FakeSessionPersistence(metadata: metadata),
+            runtimes: [runtime]
+        )
+        await model.restoreLaunchMetadata()
+        await model.resume()
+
+        let unload = Task { await model.unload() }
+        await waitUntil { await runtime.cleanupWaiterCount == 1 }
+
+        let shutdownStarted = CompletionFlag()
+        let shutdownFinished = CompletionFlag()
+        let shutdown = Task {
+            await shutdownStarted.markFinished()
+            await model.shutdown()
+            await shutdownFinished.markFinished()
+        }
+        await waitUntil { await shutdownStarted.isFinished }
+        for _ in 0..<100 { await Task.yield() }
+        #expect(await shutdownFinished.isFinished == false)
+        #expect(await runtime.cleanupWaiterCount == 1)
+
+        await runtime.releaseCleanup()
+        await unload.value
+        await shutdown.value
+
+        #expect(await shutdownFinished.isFinished)
+        #expect(await runtime.cleanupAttemptCount == 1)
+    }
+
+    @Test("Shutdown prevents a suspended create from publishing or persisting a runtime")
+    func shutdownInvalidatesSuspendedCreate() async throws {
+        let repository = try TestRepository(name: "shutdown-create-race")
+        defer { repository.remove() }
+        let runtime = FakeSessionRuntime(holdStart: true)
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([runtime]),
+            authFactory: LockedAuthQueue([])
+        ))
+        await model.restoreLaunchMetadata()
+
+        let create = Task {
+            await model.createThread(repositoryURL: repository.url, title: "Must Not Publish")
+        }
+        await waitUntil { await runtime.startIsWaiting }
+
+        await model.shutdown()
+        await create.value
+
+        #expect(model.selectedThread == nil)
+        #expect(model.sessionState == SessionState())
+        #expect(await runtime.newSessionCallCount == 0)
+        #expect(await runtime.cleanupAttemptCount == 1)
+    }
+
+    @Test("Shutdown cancels and joins repository validation before approving termination")
+    func shutdownWaitsForRepositoryValidation() async {
+        let validator = SuspendedRepositoryValidator()
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([]),
+            authFactory: LockedAuthQueue([]),
+            validateRepository: { url in try await validator.validate(url) }
+        ))
+        await model.restoreLaunchMetadata()
+
+        let create = Task {
+            await model.createThread(
+                repositoryURL: URL(filePath: "/tmp/suspended-repository-validation"),
+                title: "Must Not Start"
+            )
+        }
+        await waitUntil { await validator.isWaiting }
+
+        let canTerminate = await model.shutdown()
+        await create.value
+
+        #expect(canTerminate)
+        #expect(await validator.cancellationCount == 1)
+        #expect(await validator.isWaiting == false)
+        #expect(model.selectedThread == nil)
+    }
+
+    @Test("Shutdown disposes a private candidate before validation can publish it")
+    func shutdownInvalidatesSuspendedCandidateValidation() async {
+        let promotedOwner = FakeAuthenticationOwner(label: "unused-promotion")
+        let candidate = FakeAuthenticationCandidate(
+            promotedOwner: promotedOwner,
+            holdRefresh: true
+        )
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([]),
+            authFactory: LockedAuthQueue([]),
+            candidateFactory: LockedCandidateQueue([candidate])
+        ))
+        await model.restoreLaunchMetadata()
+
+        let validation = Task {
+            await model.validateExecutableCandidate(URL(filePath: "/bin/cat"))
+        }
+        await waitUntil { await candidate.refreshIsWaiting }
+
+        await model.shutdown()
+        await validation.value
+
+        #expect(model.executableCandidate == nil)
+        #expect(await candidate.disposeCount == 1)
+        #expect(await candidate.promoteCount == 0)
+    }
+
+    @Test("Shutdown vetoes termination when cleanup leaves a survivor")
+    func shutdownReturnsFalseForCleanupFailure() async throws {
+        let repository = try TestRepository(name: "shutdown-survivor")
+        defer { repository.remove() }
+        let metadata = makeMetadata(repositoryURL: repository.url)
+        let survivor = ProcessIdentity(pid: 55_555, processStartTime: 9)
+        let runtime = FakeSessionRuntime(cleanupReports: [
+            .init(signalled: [survivor], forceKilled: [], survivors: [survivor]),
+        ])
+        let model = makeRestorableModel(
+            metadata: metadata,
+            persistence: FakeSessionPersistence(metadata: metadata),
+            runtimes: [runtime]
+        )
+        await model.restoreLaunchMetadata()
+        await model.resume()
+
+        let canTerminate = await model.shutdown()
+
+        #expect(!canTerminate)
+        #expect(model.lifecycle == .cleanupRequired)
+        #expect(model.issue?.actions == [.retryCleanup, .quit])
+    }
+
+    @Test("Shutdown vetoes termination when the metadata store cannot close")
+    func shutdownReturnsFalseForCloseFailure() async {
+        let persistence = FakeSessionPersistence(
+            snapshot: .init(
+                settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+                selectedThread: nil
+            ),
+            closeError: .noSavedThread
+        )
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([]),
+            authFactory: LockedAuthQueue([])
+        ))
+        await model.restoreLaunchMetadata()
+
+        let canTerminate = await model.shutdown()
+
+        #expect(!canTerminate)
+        #expect(isFailed(model.lifecycle))
+        #expect(model.issue?.kind == .database)
+        #expect(await model.shutdown() == false)
     }
 
     @Test("An advertised repository trust decision continues New Thread into an idle chat")
@@ -425,10 +658,117 @@ struct SessionModelTests {
 
         #expect(model.lifecycle == .idle)
         #expect(model.selectedThread?.thread.title == "Trust Project")
-        let canonicalRepository = try RepositoryValidator().validate(repository.url)
+        let canonicalRepository = try await RepositoryValidator().validate(repository.url)
         #expect(model.selectedThread?.environment.cwd == canonicalRepository.path)
         #expect(await resolver.appliedTrustDecisions == ["trust_repo"])
         #expect(await final.newSessionCallCount == 1)
+        await model.shutdown()
+    }
+
+    @Test("A trust gate without advertised choices can retry after external resolution")
+    func repositoryTrustWithoutChoicesIsRetryable() async throws {
+        let repository = try TestRepository(name: "trust-no-choices")
+        defer { repository.remove() }
+        let blocked = FakeSessionRuntime(
+            trustStatus: untrustedRepositoryStatusWithoutChoices(cwd: repository.url)
+        )
+        let recovered = FakeSessionRuntime(trustStatus: trustedRepositoryStatus())
+        let persistence = FakeSessionPersistence(snapshot: .init(
+            settings: .init(selectedVibePath: nil, selectedThreadID: nil),
+            selectedThread: nil
+        ))
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: persistence,
+            runtimeFactory: LockedRuntimeQueue([blocked, recovered]),
+            authFactory: LockedAuthQueue([])
+        ))
+
+        await model.restoreLaunchMetadata()
+        await model.createThread(repositoryURL: repository.url, title: "Externally Trusted")
+
+        #expect(model.issue?.kind == .trustRequired)
+        #expect(model.hasPendingRepositoryTrustAction)
+        #expect(model.selectedThread == nil)
+        #expect(await blocked.appliedTrustDecisions.isEmpty)
+
+        // Simulate the user resolving trust through Vibe itself. A fresh process
+        // now reports trusted, and LeChaton retries the exact interrupted create.
+        await model.retryPendingRepositoryTrust()
+
+        #expect(model.lifecycle == .idle)
+        #expect(model.selectedThread?.thread.title == "Externally Trusted")
+        #expect(!model.hasPendingRepositoryTrustAction)
+        #expect(await recovered.newSessionCallCount == 1)
+        await model.shutdown()
+    }
+
+    @Test("Cancelling an unresolvable trust gate keeps saved metadata recoverable")
+    func repositoryTrustWithoutChoicesCanBeCancelled() async throws {
+        let repository = try TestRepository(name: "trust-cancel")
+        defer { repository.remove() }
+        let metadata = makeMetadata(repositoryURL: repository.url)
+        let blocked = FakeSessionRuntime(
+            trustStatus: untrustedRepositoryStatusWithoutChoices(cwd: repository.url)
+        )
+        let model = makeRestorableModel(
+            metadata: metadata,
+            persistence: FakeSessionPersistence(metadata: metadata),
+            runtimes: [blocked]
+        )
+
+        await model.restoreLaunchMetadata()
+        await model.resume()
+        #expect(model.issue?.kind == .trustRequired)
+        #expect(model.hasPendingRepositoryTrustAction)
+
+        model.cancelPendingRepositoryTrust()
+
+        #expect(model.lifecycle == .unloaded)
+        #expect(model.issue == nil)
+        #expect(model.trust == .unknown)
+        #expect(model.selectedThread == metadata)
+        #expect(model.canResume)
+        #expect(!model.hasPendingRepositoryTrustAction)
+        await model.shutdown()
+    }
+
+    @Test("Current executable sign-in stays on one auth owner and still requires Resume")
+    func currentAuthenticationUsesSameOwner() async throws {
+        let repository = try TestRepository(name: "current-auth")
+        defer { repository.remove() }
+        let metadata = makeMetadata(repositoryURL: repository.url)
+        let runtime = FakeSessionRuntime()
+        let runtimeFactory = LockedRuntimeQueue([runtime])
+        let authOwner = FakeAuthenticationOwner(authenticated: false)
+        let model = SessionModel(dependencies: makeDependencies(
+            persistence: FakeSessionPersistence(metadata: metadata),
+            runtimeFactory: runtimeFactory,
+            authFactory: LockedAuthQueue([authOwner])
+        ))
+
+        await model.restoreLaunchMetadata()
+        await model.resume()
+
+        #expect(model.issue?.kind == .authenticationRequired)
+        #expect(runtimeFactory.makeCount == 0)
+
+        let signInURL = try await model.startCurrentAuthentication()
+        #expect(signInURL.absoluteString == "https://example.test/current-auth")
+        #expect(model.currentAuthenticationAttempt?.id == "current-attempt")
+
+        try await model.completeCurrentAuthentication(attemptID: "current-attempt")
+
+        #expect(model.authentication == .status(authenticationStatus(authenticated: true)))
+        #expect(model.currentAuthenticationAttempt == nil)
+        #expect(model.lifecycle == .unloaded)
+        #expect(model.issue == nil)
+        #expect(runtimeFactory.makeCount == 0)
+        #expect(await authOwner.delegatedStartCount == 1)
+        #expect(await authOwner.delegatedCompletionIDs == ["current-attempt"])
+
+        await model.resume()
+        #expect(model.lifecycle == .idle)
+        #expect(runtimeFactory.makeCount == 1)
         await model.shutdown()
     }
 }
@@ -469,23 +809,31 @@ private actor FakeSessionRuntime: SessionRuntime {
     private let diagnosticStream: AsyncStream<ACPDiagnostic>
     private let diagnosticContinuation: AsyncStream<ACPDiagnostic>.Continuation
     private(set) var newSessionCallCount = 0
+    private let holdStart: Bool
     private let holdPrompt: Bool
     private let holdPermissionResponse: Bool
+    private let holdCleanup: Bool
+    private let configurationError: ACPTransportError?
     private let trustStatus: VibeRepositoryTrustStatus
     private let trustDecisionStatus: VibeRepositoryTrustStatus
+    private var startContinuation: CheckedContinuation<Void, Never>?
     private var promptContinuation: CheckedContinuation<PromptResult, Never>?
     private var permissionContinuation: CheckedContinuation<Void, Never>?
     private(set) var selectedPermissionReplies: [RPCID] = []
     private(set) var appliedTrustDecisions: [String] = []
     private var cleanupReports: [ProcessCleanupReport]
     private(set) var cleanupAttemptCount = 0
+    private var cleanupContinuations: [CheckedContinuation<Void, Never>] = []
 
     init(
         label: String = "runtime",
         log: OperationLog? = nil,
         loadBehavior: FakeLoadBehavior? = nil,
+        holdStart: Bool = false,
         holdPrompt: Bool = false,
         holdPermissionResponse: Bool = false,
+        holdCleanup: Bool = false,
+        configurationError: ACPTransportError? = nil,
         cleanupReports: [ProcessCleanupReport] = [],
         trustStatus: VibeRepositoryTrustStatus = trustedRepositoryStatus(),
         trustDecisionStatus: VibeRepositoryTrustStatus = trustedRepositoryStatus()
@@ -500,8 +848,11 @@ private actor FakeSessionRuntime: SessionRuntime {
             throughSequence: 0,
             configurationOptions: []
         )
+        self.holdStart = holdStart
         self.holdPrompt = holdPrompt
         self.holdPermissionResponse = holdPermissionResponse
+        self.holdCleanup = holdCleanup
+        self.configurationError = configurationError
         self.trustStatus = trustStatus
         self.trustDecisionStatus = trustDecisionStatus
         self.cleanupReports = cleanupReports
@@ -512,6 +863,9 @@ private actor FakeSessionRuntime: SessionRuntime {
 
     func start() async throws -> SessionRuntimeStart {
         await log?.append("\(label).start")
+        if holdStart {
+            await withCheckedContinuation { startContinuation = $0 }
+        }
         return .init(generation: generation, compatibility: testCompatibility())
     }
 
@@ -578,7 +932,8 @@ private actor FakeSessionRuntime: SessionRuntime {
         kind _: VibeConfigurationOption.Kind,
         value _: JSONValue
     ) async throws -> VibeConfigurationWriteResult {
-        .init(options: [], metadata: nil, raw: .object([:]))
+        if let configurationError { throw configurationError }
+        return .init(options: [], metadata: nil, raw: .object([:]))
     }
 
     func respondToPermission(id: RPCID, selectedOptionID _: String) async throws {
@@ -596,14 +951,27 @@ private actor FakeSessionRuntime: SessionRuntime {
 
     func stop() async -> ProcessCleanupReport? {
         await log?.append("\(label).stop")
+        startContinuation?.resume()
+        startContinuation = nil
         updateContinuation.finish()
         requestContinuation.finish()
         diagnosticContinuation.finish()
+        if holdCleanup { await waitForCleanupRelease() }
         return nextCleanupReport()
     }
 
     func retryCleanup() async throws -> ProcessCleanupReport? {
-        nextCleanupReport()
+        if holdCleanup { await waitForCleanupRelease() }
+        return nextCleanupReport()
+    }
+
+    var cleanupWaiterCount: Int { cleanupContinuations.count }
+    var startIsWaiting: Bool { startContinuation != nil }
+
+    func releaseCleanup() {
+        let continuations = cleanupContinuations
+        cleanupContinuations.removeAll()
+        for continuation in continuations { continuation.resume() }
     }
 
     var permissionResponseIsWaiting: Bool { permissionContinuation != nil }
@@ -630,10 +998,26 @@ private actor FakeSessionRuntime: SessionRuntime {
         ))
     }
 
+    func emitLiveUpdate(sequence: UInt64, payload: SessionUpdate) {
+        updateContinuation.yield(.init(
+            runtimeGeneration: generation,
+            loadAttemptID: nil,
+            sequence: sequence,
+            deliveryPhase: .live,
+            payload: payload
+        ))
+    }
+
     private func nextCleanupReport() -> ProcessCleanupReport {
         cleanupAttemptCount += 1
         if !cleanupReports.isEmpty { return cleanupReports.removeFirst() }
         return .init(signalled: [], forceKilled: [], survivors: [])
+    }
+
+    private func waitForCleanupRelease() async {
+        await withCheckedContinuation { continuation in
+            cleanupContinuations.append(continuation)
+        }
     }
 
     private func promptResult() -> PromptResult {
@@ -656,15 +1040,48 @@ private actor FakeSessionRuntime: SessionRuntime {
 private actor FakeAuthenticationOwner: SessionAuthenticationOwner {
     let label: String
     let log: OperationLog?
+    private var status: VibeAuthenticationStatus
+    private var pendingAttempt: VibeDelegatedAuthenticationAttempt?
+    private(set) var delegatedStartCount = 0
+    private(set) var delegatedCompletionIDs: [String] = []
 
-    init(label: String = "auth", log: OperationLog? = nil) {
+    init(
+        label: String = "auth",
+        log: OperationLog? = nil,
+        authenticated: Bool = true
+    ) {
         self.label = label
         self.log = log
+        status = authenticationStatus(authenticated: authenticated)
     }
 
     func refresh() async throws -> VibeAuthenticationSnapshot {
         await log?.append("\(label).refresh")
-        return authenticatedSnapshot()
+        return .init(compatibility: testCompatibility(), status: status)
+    }
+
+    func startDelegatedAuthentication() async throws -> VibeDelegatedAuthenticationAttempt {
+        delegatedStartCount += 1
+        let attempt = VibeDelegatedAuthenticationAttempt(
+            id: "current-attempt",
+            signInURL: URL(string: "https://example.test/current-auth")!,
+            expiresAt: nil,
+            raw: .object([:])
+        )
+        pendingAttempt = attempt
+        return attempt
+    }
+
+    func completeDelegatedAuthentication(attemptID: String) async throws -> VibeAuthenticationStatus {
+        delegatedCompletionIDs.append(attemptID)
+        guard pendingAttempt?.id == attemptID else { throw AuthCoordinatorError.noPendingAttempt }
+        pendingAttempt = nil
+        status = authenticationStatus(authenticated: true)
+        return status
+    }
+
+    func pendingDelegatedAuthentication() -> VibeDelegatedAuthenticationAttempt? {
+        pendingAttempt
     }
 
     func dispose() async throws -> ProcessCleanupReport? {
@@ -680,14 +1097,26 @@ private actor FakeAuthenticationOwner: SessionAuthenticationOwner {
 private actor FakeAuthenticationCandidate: SessionAuthenticationCandidate {
     private let promotedOwner: any SessionAuthenticationOwner
     private let log: OperationLog?
+    private let holdRefresh: Bool
+    private var refreshContinuation: CheckedContinuation<Void, Never>?
+    private(set) var disposeCount = 0
+    private(set) var promoteCount = 0
 
-    init(promotedOwner: any SessionAuthenticationOwner, log: OperationLog? = nil) {
+    init(
+        promotedOwner: any SessionAuthenticationOwner,
+        log: OperationLog? = nil,
+        holdRefresh: Bool = false
+    ) {
         self.promotedOwner = promotedOwner
         self.log = log
+        self.holdRefresh = holdRefresh
     }
 
     func refresh() async throws -> VibeAuthenticationSnapshot {
         await log?.append("candidate.refresh")
+        if holdRefresh {
+            await withCheckedContinuation { refreshContinuation = $0 }
+        }
         return authenticatedSnapshot(executable: testExecutable(path: "/bin/cat"))
     }
 
@@ -700,6 +1129,7 @@ private actor FakeAuthenticationCandidate: SessionAuthenticationCandidate {
     }
 
     func promote() async throws -> SessionAuthenticationPromotion {
+        promoteCount += 1
         await log?.append("candidate.promote")
         return .init(
             owner: promotedOwner,
@@ -708,25 +1138,40 @@ private actor FakeAuthenticationCandidate: SessionAuthenticationCandidate {
     }
 
     func dispose() async throws -> ProcessCleanupReport? {
+        disposeCount += 1
         await log?.append("candidate.dispose")
+        refreshContinuation?.resume()
+        refreshContinuation = nil
         return .init(signalled: [], forceKilled: [], survivors: [])
     }
 
     func retryCleanup() async throws -> ProcessCleanupReport? {
         .init(signalled: [], forceKilled: [], survivors: [])
     }
+
+    var refreshIsWaiting: Bool { refreshContinuation != nil }
 }
 
 private actor FakeSessionPersistence {
     private var snapshot: PersistenceSnapshot
     private let log: OperationLog?
+    private let closeError: SessionModelError?
 
-    init(snapshot: PersistenceSnapshot, log: OperationLog? = nil) {
+    init(
+        snapshot: PersistenceSnapshot,
+        log: OperationLog? = nil,
+        closeError: SessionModelError? = nil
+    ) {
         self.snapshot = snapshot
         self.log = log
+        self.closeError = closeError
     }
 
-    init(metadata: SavedThreadMetadata, log: OperationLog? = nil) {
+    init(
+        metadata: SavedThreadMetadata,
+        log: OperationLog? = nil,
+        closeError: SessionModelError? = nil
+    ) {
         snapshot = .init(
             settings: .init(
                 selectedVibePath: "/bin/echo",
@@ -735,6 +1180,7 @@ private actor FakeSessionPersistence {
             selectedThread: metadata
         )
         self.log = log
+        self.closeError = closeError
     }
 
     nonisolated func client() -> SessionPersistenceClient {
@@ -747,8 +1193,12 @@ private actor FakeSessionPersistence {
             removeSelectedThread: { id in try await self.remove(id: id) },
             updateSelectedVibePath: { url in await self.updatePath(url) },
             resetLocalMetadata: { await self.reset() },
-            close: {}
+            close: { try await self.closeStore() }
         )
+    }
+
+    private func closeStore() throws {
+        if let closeError { throw closeError }
     }
 
     private func snapshotValue() -> PersistenceSnapshot { snapshot }
@@ -825,9 +1275,31 @@ private actor FakeSessionPersistence {
     }
 }
 
+private actor SuspendedRepositoryValidator {
+    private(set) var isWaiting = false
+    private(set) var cancellationCount = 0
+
+    func validate(_ url: URL) async throws -> CanonicalRepository {
+        isWaiting = true
+        defer { isWaiting = false }
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch is CancellationError {
+            cancellationCount += 1
+            throw CancellationError()
+        }
+        return CanonicalRepository(path: url.path)
+    }
+}
+
 private actor OperationLog {
     private(set) var events: [String] = []
     func append(_ event: String) { events.append(event) }
+}
+
+private actor CompletionFlag {
+    private(set) var isFinished = false
+    func markFinished() { isFinished = true }
 }
 
 private final class LockedRuntimeQueue: @unchecked Sendable {
@@ -926,12 +1398,16 @@ private func makeDependencies(
     runtimeFactory: LockedRuntimeQueue,
     authFactory: LockedAuthQueue,
     candidateFactory: LockedCandidateQueue = LockedCandidateQueue([]),
+    validateRepository: @escaping @Sendable (URL) async throws -> CanonicalRepository = {
+        try await RepositoryValidator().validate($0)
+    },
     validateExecutable: @escaping @Sendable (URL) throws -> VibeExecutable = { url in
         testExecutable(path: url.path)
     }
 ) -> SessionModelDependencies {
     .init(
         persistence: persistence.client(),
+        validateRepository: validateRepository,
         locateExecutable: { _ in testExecutable() },
         validateExecutable: validateExecutable,
         makeRuntime: { _, _ in runtimeFactory.next() },
@@ -985,6 +1461,16 @@ private func untrustedRepositoryStatus(cwd: URL) -> VibeRepositoryTrustStatus {
     ]))
 }
 
+private func untrustedRepositoryStatusWithoutChoices(cwd: URL) -> VibeRepositoryTrustStatus {
+    .init(raw: .object([
+        "trust_status": .string("untrusted"),
+        "details": .object([
+            "cwd": .string(cwd.path),
+            "availableDecisions": .array([]),
+        ]),
+    ]))
+}
+
 private func configurationOption(current: String) -> JSONValue {
     .object([
         "id": .string("model"),
@@ -1025,8 +1511,12 @@ private func authenticatedSnapshot(
 ) -> VibeAuthenticationSnapshot {
     .init(
         compatibility: testCompatibility(executable: executable),
-        status: .init(raw: .object(["authenticated": .bool(true)]))
+        status: authenticationStatus(authenticated: true)
     )
+}
+
+private func authenticationStatus(authenticated: Bool) -> VibeAuthenticationStatus {
+    .init(raw: .object(["authenticated": .bool(authenticated)]))
 }
 
 private func isFailed(_ lifecycle: SessionLifecycle) -> Bool {
@@ -1036,9 +1526,9 @@ private func isFailed(_ lifecycle: SessionLifecycle) -> Bool {
 
 @MainActor
 private func waitUntil(_ predicate: () async -> Bool) async {
-    for _ in 0..<1_000 {
+    for _ in 0..<2_000 {
         if await predicate() { return }
-        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(1))
     }
     Issue.record("Condition did not become true")
 }

@@ -276,11 +276,9 @@ struct PersistenceStoreTests {
         }
         try environmentQueue.close()
 
-        let incompleteStore = try PersistenceStore(applicationSupportRoot: environmentRoot)
-        await #expect(throws: PersistenceStoreError.self) {
-            _ = try await incompleteStore.restoreMetadata()
+        #expect(throws: PersistenceStoreError.self) {
+            _ = try PersistenceStore(applicationSupportRoot: environmentRoot)
         }
-        try await incompleteStore.close()
 
         let settingsRoot = try PersistenceTestSupport.makeApplicationSupportRoot()
         defer { try? FileManager.default.removeItem(at: settingsRoot) }
@@ -294,10 +292,124 @@ struct PersistenceStoreTests {
         }
         try settingsQueue.close()
 
-        let missingSettingsStore = try PersistenceStore(applicationSupportRoot: settingsRoot)
-        await #expect(throws: PersistenceStoreError.self) {
-            _ = try await missingSettingsStore.restoreMetadata()
+        #expect(throws: PersistenceStoreError.self) {
+            _ = try PersistenceStore(applicationSupportRoot: settingsRoot)
         }
-        try await missingSettingsStore.close()
     }
+
+    @Test("Restoration rejects a Thread environment outside its canonical Project root")
+    func restorationRequiresMatchingProjectAndEnvironmentRoots() async throws {
+        let root = try PersistenceTestSupport.makeApplicationSupportRoot()
+        let repository = try PersistenceTestSupport.makeRepository()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: repository.deletingLastPathComponent())
+        }
+
+        let store = try PersistenceStore(applicationSupportRoot: root)
+        let selected = try await store.createThread(.init(
+            repositoryURL: repository,
+            vibeSessionID: "mismatched-environment",
+            title: "Mismatched Environment"
+        ))
+        try await store.close()
+
+        let queue = try PersistenceTestSupport.databaseQueue(
+            at: PersistenceLocations(applicationSupportRoot: root).databaseFile
+        )
+        try await queue.write { db in
+            try db.execute(
+                sql: "UPDATE thread_environments SET cwd = ? WHERE thread_id = ?",
+                arguments: ["/tmp/not-the-project", selected.thread.id.uuidString.lowercased()]
+            )
+        }
+        try queue.close()
+
+        #expect(throws: PersistenceStoreError.self) {
+            _ = try PersistenceStore(applicationSupportRoot: root)
+        }
+    }
+
+    @Test("Closing the store cancels and joins in-flight repository validation")
+    func closeJoinsRepositoryValidation() async throws {
+        let root = try PersistenceTestSupport.makeApplicationSupportRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let validator = SuspendedStoreRepositoryValidator()
+        let store = try PersistenceStore(
+            locations: PersistenceLocations(applicationSupportRoot: root),
+            clock: { Date(timeIntervalSince1970: 1_720_000_000) },
+            makeUUID: { UUID() },
+            validateRepository: { url in try await validator.validate(url) }
+        )
+
+        let create = Task {
+            try await store.createThread(.init(
+                repositoryURL: root,
+                vibeSessionID: "must-not-persist",
+                title: "Cancelled"
+            ))
+        }
+        await waitUntil { await validator.isWaiting }
+
+        let closeCompletion = PersistenceCloseCompletion()
+        let close = Task {
+            try await store.close()
+            await closeCompletion.markFinished()
+        }
+        await waitUntil { await validator.cancellationObserved }
+        for _ in 0 ..< 100 { await Task.yield() }
+        #expect(await closeCompletion.isFinished == false)
+
+        await validator.releaseCleanup()
+        try await close.value
+        await #expect(throws: CancellationError.self) {
+            _ = try await create.value
+        }
+        #expect(await closeCompletion.isFinished)
+        await #expect(throws: PersistenceStoreError.storeClosed) {
+            _ = try await store.restoreMetadata()
+        }
+    }
+}
+
+private actor SuspendedStoreRepositoryValidator {
+    private(set) var isWaiting = false
+    private(set) var cancellationObserved = false
+    private var cleanupContinuation: CheckedContinuation<Void, Never>?
+
+    func validate(_ url: URL) async throws -> CanonicalRepository {
+        isWaiting = true
+        defer { isWaiting = false }
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch is CancellationError {
+            cancellationObserved = true
+            await withCheckedContinuation { cleanupContinuation = $0 }
+            throw CancellationError()
+        }
+        return CanonicalRepository(path: url.path)
+    }
+
+    func releaseCleanup() {
+        cleanupContinuation?.resume()
+        cleanupContinuation = nil
+    }
+}
+
+private actor PersistenceCloseCompletion {
+    private(set) var isFinished = false
+
+    func markFinished() {
+        isFinished = true
+    }
+}
+
+private func waitUntil(
+    _ condition: @escaping @Sendable () async -> Bool
+) async {
+    for _ in 0 ..< 2_000 {
+        if await condition() { return }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    Issue.record("Timed out waiting for an asynchronous persistence condition")
 }

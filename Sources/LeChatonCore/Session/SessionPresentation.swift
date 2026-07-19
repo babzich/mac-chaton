@@ -109,6 +109,7 @@ public enum SessionModelError: Error, Equatable, Sendable, CustomStringConvertib
     case replayStreamEnded
     case cleanupIncomplete(Set<ProcessIdentity>)
     case cleanupOutstanding
+    case shuttingDown
     case authenticationRequired
     case repositoryTrustRequired
     case unsupportedTrustDecision(String)
@@ -130,6 +131,7 @@ public enum SessionModelError: Error, Equatable, Sendable, CustomStringConvertib
         case let .cleanupIncomplete(survivors):
             "Runtime cleanup left \(survivors.count) verified process survivor(s)"
         case .cleanupOutstanding: "A previous process owner still requires verified cleanup"
+        case .shuttingDown: "LeChaton is shutting down"
         case .authenticationRequired: "Vibe authentication is required"
         case .repositoryTrustRequired: "Repository trust must be resolved through Vibe"
         case let .unsupportedTrustDecision(decision):

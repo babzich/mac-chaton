@@ -83,6 +83,105 @@ struct ACPTransportTests {
         _ = await transport.stop(gracePeriod: .milliseconds(50))
     }
 
+    @Test("Permission queue admission failure remains retryable and commits once")
+    func permissionAdmissionFailureIsRetryable() async throws {
+        let transport = makePermissionBackpressureTransport()
+        _ = try await transport.start()
+        _ = try await withTimeout { try await transport.initialize() }
+        let session = try await withTimeout { try await transport.newSession(cwd: repositoryURL) }
+        var requests = await transport.incomingRequests().makeAsyncIterator()
+        let prompt = Task {
+            try await transport.prompt(sessionID: session.sessionID, text: "Queue pressure")
+        }
+        let incoming = try #require(await requests.next())
+        let permission = try #require(PermissionRequest(incoming))
+
+        // The shell agent stops reading after issuing the permission. One large
+        // active frame plus this queued frame fills the two-frame writer bound.
+        let blockingWrite = Task {
+            try await transport.sendNotification(
+                method: "_test/blocking",
+                params: .object([
+                    "payload": .string(String(repeating: "x", count: 1_024 * 1_024)),
+                ])
+            )
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let queuedWrite = Task {
+            try await transport.sendNotification(method: "_test/queued")
+        }
+        try await Task.sleep(for: .milliseconds(25))
+
+        do {
+            try await transport.respondToPermission(
+                id: permission.requestID,
+                selectedOptionID: permission.options[0].optionID
+            )
+            Issue.record("Expected bounded writer admission to fail")
+        } catch let error as ACPTransportError {
+            guard case .outgoingQueueFull(maximumFrames: 2, maximumBytes: 4 * 1_024 * 1_024) = error else {
+                Issue.record("Expected outgoing queue admission failure, got \(error)")
+                _ = await transport.stop(gracePeriod: .milliseconds(20))
+                return
+            }
+        }
+        #expect(await transport.failure() == nil)
+
+        // Removing only the queued frame creates one admission slot. The same
+        // permission ID must still be retryable after the failed admission.
+        queuedWrite.cancel()
+        _ = await queuedWrite.result
+        try await transport.respondToPermission(
+            id: permission.requestID,
+            selectedOptionID: permission.options[0].optionID
+        )
+
+        // The accepted retry consumes the ID. With the queue full again, a
+        // duplicate would throw if it attempted to enqueue a second response.
+        try await transport.respondToPermission(
+            id: permission.requestID,
+            selectedOptionID: permission.options[0].optionID
+        )
+
+        let report = try await withTimeout {
+            await transport.stop(gracePeriod: .milliseconds(20))
+        }
+        #expect(report?.survivors.isEmpty == true)
+        _ = await blockingWrite.result
+        _ = await prompt.result
+    }
+
+    @Test("Writer stop joins the active worker before returning")
+    func writerStopJoinsActiveWorker() async throws {
+        let pipe = Pipe()
+        defer {
+            try? pipe.fileHandleForReading.close()
+            try? pipe.fileHandleForWriting.close()
+        }
+        let probe = BlockingWriteProbe()
+        let writer = try ACPStandardInputWriter(
+            fileDescriptor: pipe.fileHandleForWriting.fileDescriptor,
+            maximumFrameBytes: 1_024,
+            maximumPendingFrames: 2,
+            maximumPendingBytes: 2_048,
+            writeOperation: { data, _, _ in probe.write(byteCount: data.count) }
+        )
+        _ = try writer.enqueue(Data("frame\n".utf8), timeout: .seconds(1))
+        _ = try await eventually { probe.hasStarted ? true : nil }
+
+        let completion = WriterStopCompletion()
+        let stop = Task {
+            await writer.stop()
+            await completion.markFinished()
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await completion.isFinished == false)
+
+        probe.release()
+        try await withTimeout { await stop.value }
+        #expect(await completion.isFinished)
+    }
+
     @Test("Cancellation and permission cancellation are idempotent")
     func cancellationIsIdempotent() async throws {
         let transport = try makeTransport(scenario: "standard")
@@ -316,11 +415,146 @@ struct ACPTransportTests {
         _ = await transport.stop(gracePeriod: .milliseconds(50))
     }
 
+    @Test("A missing load response reaches its deadline and fails the runtime")
+    func loadResponseDeadline() async throws {
+        let transport = try makeTransport(
+            scenario: "no-load-response",
+            responseTimeout: .milliseconds(100)
+        )
+        _ = try await transport.start()
+        _ = try await withTimeout { try await transport.initialize() }
+
+        do {
+            _ = try await withTimeout(timeout: .seconds(1)) {
+                try await transport.loadSession(sessionID: "saved-session", cwd: repositoryURL)
+            }
+            Issue.record("Expected session/load to time out")
+        } catch let error as ACPTransportError {
+            #expect(error == .responseTimedOut(method: "session/load"))
+        }
+        #expect(await transport.failure() == .responseTimedOut(method: "session/load"))
+        _ = await transport.stop(gracePeriod: .milliseconds(50))
+    }
+
+    @Test("Configuration and authentication extension requests have finite response deadlines")
+    func extensionResponseDeadlines() async throws {
+        for (scenario, method) in [
+            ("no-config-response", "session/set_config_option"),
+            ("no-auth-response", "_auth/status"),
+        ] {
+            let transport = try makeTransport(
+                scenario: scenario,
+                responseTimeout: .seconds(1)
+            )
+            _ = try await transport.start()
+            _ = try await withTimeout { try await transport.initialize() }
+
+            do {
+                _ = try await withTimeout(timeout: .seconds(1)) {
+                    try await transport.request(
+                        method: method,
+                        params: .object([:]),
+                        responseTimeout: .milliseconds(100)
+                    )
+                }
+                Issue.record("Expected \(method) to time out")
+            } catch let error as ACPTransportError {
+                #expect(error == .responseTimedOut(method: method))
+            }
+            #expect(await transport.failure() == .responseTimedOut(method: method))
+            _ = await transport.stop(gracePeriod: .milliseconds(50))
+        }
+    }
+
+    @Test("Standard-input backpressure times out without starving the transport actor")
+    func standardInputBackpressure() async throws {
+        let transport = try makeTransport(
+            scenario: "stdin-backpressure",
+            standardInputWriteTimeout: .milliseconds(100),
+            responseTimeout: .seconds(1)
+        )
+        let generation = try await transport.start()
+        _ = try await withTimeout { try await transport.initialize() }
+
+        let send = Task {
+            try await transport.sendNotification(
+                method: "_fake/large_notification",
+                params: .object([
+                    "payload": .string(String(repeating: "x", count: 1_024 * 1_024)),
+                ])
+            )
+        }
+
+        // This actor hop must remain responsive while the detached writer is
+        // waiting for the child's full stdin pipe to become writable.
+        let observedGeneration = try await withTimeout(timeout: .milliseconds(250)) {
+            await transport.currentGeneration()
+        }
+        #expect(observedGeneration == generation)
+
+        do {
+            try await withTimeout(timeout: .seconds(1)) { try await send.value }
+            Issue.record("Expected bounded standard-input write timeout")
+        } catch let error as ACPTransportError {
+            #expect(error == .writeTimedOut)
+        }
+        #expect(try await eventually { await transport.failure() } == .writeTimedOut)
+        _ = await transport.stop(gracePeriod: .milliseconds(50))
+    }
+
+    @Test("Oversized outgoing frames are rejected before entering the writer queue")
+    func outgoingFrameCap() async throws {
+        let transport = try makeTransport(scenario: "standard", maximumFrameBytes: 256)
+        _ = try await transport.start()
+
+        do {
+            try await transport.sendNotification(
+                method: "_fake/oversized",
+                params: .object(["payload": .string(String(repeating: "x", count: 512))])
+            )
+            Issue.record("Expected outgoing frame cap")
+        } catch let error as ACPTransportError {
+            #expect(error == .outgoingFrameTooLarge(maximumBytes: 256))
+        }
+        #expect(await transport.failure() == nil)
+        _ = await transport.stop(gracePeriod: .milliseconds(50))
+    }
+
+    @Test("Frames larger than the pending-byte budget are rejected without trapping")
+    func outgoingPendingByteCap() async throws {
+        let transport = try makeTransport(
+            scenario: "standard",
+            maximumFrameBytes: 1_024,
+            maximumPendingOutgoingBytes: 256
+        )
+        _ = try await transport.start()
+
+        do {
+            try await transport.sendNotification(
+                method: "_fake/pending-byte-cap",
+                params: .object(["payload": .string(String(repeating: "x", count: 512))])
+            )
+            Issue.record("Expected pending-byte queue cap")
+        } catch let error as ACPTransportError {
+            #expect(error == .outgoingQueueFull(maximumFrames: 64, maximumBytes: 256))
+        }
+        #expect(await transport.failure() == nil)
+        _ = await transport.stop(gracePeriod: .milliseconds(50))
+    }
+
     private var repositoryURL: URL {
         URL(filePath: FileManager.default.currentDirectoryPath)
     }
 
-    private func makeTransport(scenario: String) throws -> ACPTransport {
+    private func makeTransport(
+        scenario: String,
+        maximumFrameBytes: Int = 16 * 1_024 * 1_024,
+        maximumPendingOutgoingFrames: Int = 64,
+        maximumPendingOutgoingBytes: Int = 32 * 1_024 * 1_024,
+        standardInputWriteTimeout: Duration = .seconds(5),
+        responseTimeout: Duration = .seconds(60),
+        promptResponseTimeout: Duration = .seconds(600)
+    ) throws -> ACPTransport {
         let executable = try fakeExecutableURL()
         return ACPTransport(configuration: .init(
             executableURL: executable,
@@ -331,7 +565,38 @@ struct ACPTransportTests {
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                 // The fake is a test-only command-line product linked to the core framework.
                 "DYLD_FRAMEWORK_PATH": executable.deletingLastPathComponent().path,
-            ]
+            ],
+            maximumFrameBytes: maximumFrameBytes,
+            maximumPendingOutgoingFrames: maximumPendingOutgoingFrames,
+            maximumPendingOutgoingBytes: maximumPendingOutgoingBytes,
+            standardInputWriteTimeout: standardInputWriteTimeout,
+            responseTimeout: responseTimeout,
+            promptResponseTimeout: promptResponseTimeout
+        ))
+    }
+
+    private func makePermissionBackpressureTransport() -> ACPTransport {
+        let script = #"""
+        IFS= read -r initialize
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+        IFS= read -r new_session
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"queue-session"}}'
+        IFS= read -r prompt
+        printf '%s\n' '{"jsonrpc":"2.0","id":"permission-queue","method":"session/request_permission","params":{"sessionId":"queue-session","toolCall":{"toolCallId":"tool-queue"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}'
+        kill -STOP $$
+        """#
+        return ACPTransport(configuration: .init(
+            executableURL: URL(filePath: "/bin/sh"),
+            arguments: ["-c", script],
+            workingDirectory: repositoryURL,
+            environment: [
+                "HOME": NSHomeDirectory(),
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            ],
+            maximumFrameBytes: 2 * 1_024 * 1_024,
+            maximumPendingOutgoingFrames: 2,
+            maximumPendingOutgoingBytes: 4 * 1_024 * 1_024,
+            standardInputWriteTimeout: .seconds(10)
         ))
     }
 
@@ -389,6 +654,42 @@ struct ACPTransportTests {
 }
 
 private final class TestBundleMarker {}
+
+private final class BlockingWriteProbe: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var started = false
+    private var released = false
+
+    var hasStarted: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return started
+    }
+
+    func write(byteCount: Int) -> Int {
+        condition.lock()
+        started = true
+        condition.broadcast()
+        while !released { condition.wait() }
+        condition.unlock()
+        return byteCount
+    }
+
+    func release() {
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+private actor WriterStopCompletion {
+    private(set) var isFinished = false
+
+    func markFinished() {
+        isFinished = true
+    }
+}
 
 private enum TestSupportError: Error, CustomStringConvertible {
     case fakeAgentNotFound([String])

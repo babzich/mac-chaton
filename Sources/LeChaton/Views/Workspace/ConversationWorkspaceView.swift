@@ -11,7 +11,7 @@ struct ConversationWorkspaceView: View {
         Group {
             if let metadata = workspace.model.selectedThread {
                 VStack(spacing: 0) {
-                    SessionHeaderView(metadata: metadata, lifecycle: workspace.model.lifecycle)
+                    SessionHeaderView(metadata: metadata)
 
                     if let issue = workspace.model.issue {
                         SessionRecoveryBanner(
@@ -56,8 +56,7 @@ struct ConversationWorkspaceView: View {
                                 .buttonStyle(.borderedProminent)
                                 .tint(LeChatonTheme.orange)
                                 .foregroundStyle(LeChatonTheme.onAccent)
-                                .keyboardShortcut("n")
-                                .disabled(workspace.model.issue?.kind == .database)
+                                .disabled(!workspace.canCreateThread)
                         }
                     }
                 }
@@ -95,9 +94,18 @@ struct ConversationWorkspaceView: View {
                 ExplicitResumeBar(workspace: workspace, label: "Resume to reconcile Vibe configuration")
             }
 
-        case .cleanupRequired, .swapFailed:
+        case .cleanupRequired:
             historySurface
                 .disabled(true)
+
+        case .swapFailed:
+            VStack(spacing: 0) {
+                historySurface
+                    .disabled(true)
+                if workspace.model.executableCandidate != nil {
+                    ExecutableCandidateRecoveryBar()
+                }
+            }
 
         case .failed:
             VStack(spacing: 0) {
@@ -110,7 +118,11 @@ struct ConversationWorkspaceView: View {
         default:
             VStack(spacing: 0) {
                 historySurface
-                PromptComposerView(workspace: workspace)
+                if workspace.model.lifecycle == .idle, !workspace.isGitBaselineReady {
+                    GitBaselineRequiredBar(workspace: workspace)
+                } else {
+                    PromptComposerView(workspace: workspace)
+                }
             }
         }
     }
@@ -139,9 +151,64 @@ struct ConversationWorkspaceView: View {
     }
 }
 
+private struct GitBaselineRequiredBar: View {
+    let workspace: WorkspaceController
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if workspace.git.isLoading {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundStyle(LeChatonTheme.amber)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(workspace.git.isLoading ? "Capturing repository baseline…" : "Repository baseline required")
+                    .font(.callout.weight(.semibold))
+                Text("Prompts stay disabled until the pre-existing Git state is captured.")
+                    .font(.caption)
+                    .foregroundStyle(LeChatonTheme.secondaryText)
+            }
+            Spacer()
+            if !workspace.git.isLoading {
+                Button("Retry Baseline") {
+                    Task { await workspace.refreshGit() }
+                }
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial)
+        .overlay(alignment: .top) {
+            Rectangle().fill(LeChatonTheme.hairline).frame(height: 1)
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct ExecutableCandidateRecoveryBar: View {
+    var body: some View {
+        HStack {
+            Label(
+                "The committed executable was revalidated. Review and publish its owner in Settings.",
+                systemImage: "checkmark.shield"
+            )
+            .font(.callout)
+            Spacer()
+            SettingsLink {
+                Text("Review Candidate")
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial)
+        .overlay(alignment: .top) {
+            Rectangle().fill(LeChatonTheme.hairline).frame(height: 1)
+        }
+    }
+}
+
 private struct SessionHeaderView: View {
     let metadata: SavedThreadMetadata
-    let lifecycle: SessionLifecycle
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
@@ -225,6 +292,7 @@ private struct ExplicitResumeBar: View {
 private struct PromptComposerView: View {
     let workspace: WorkspaceController
     @State private var prompt = ""
+    @FocusState private var promptIsFocused: Bool
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 10) {
@@ -232,8 +300,10 @@ private struct PromptComposerView: View {
                 .lineLimit(1 ... 6)
                 .textFieldStyle(.roundedBorder)
                 .tint(LeChatonTheme.orange)
-                .disabled(!workspace.model.canPrompt)
+                .focused($promptIsFocused)
+                .disabled(!workspace.canPrompt)
                 .accessibilityLabel("Prompt")
+                .accessibilityHint("Press Command-Return to send")
 
             if workspace.model.lifecycle == .prompting || workspace.model.lifecycle == .cancelling {
                 Button("Cancel", systemImage: "stop.fill") {
@@ -248,13 +318,19 @@ private struct PromptComposerView: View {
                     .tint(LeChatonTheme.orange)
                     .foregroundStyle(LeChatonTheme.onAccent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(!workspace.model.canPrompt || trimmedPrompt.isEmpty)
+                    .disabled(!workspace.canPrompt || trimmedPrompt.isEmpty)
             }
         }
         .padding(12)
         .background(.regularMaterial)
         .overlay(alignment: .top) {
             Rectangle().fill(LeChatonTheme.hairline).frame(height: 1)
+        }
+        .onAppear {
+            if workspace.canPrompt { promptIsFocused = true }
+        }
+        .onChange(of: workspace.canPrompt) { _, canPrompt in
+            if canPrompt { promptIsFocused = true }
         }
     }
 

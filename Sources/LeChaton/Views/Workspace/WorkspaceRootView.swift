@@ -19,17 +19,23 @@ struct WorkspaceRootView: View {
             detail
         }
         .navigationTitle(workspace.model.selectedThread?.thread.title ?? "LeChaton")
+        .onChange(of: workspace.model.selectedThread?.thread.id) { _, threadID in
+            if threadID == nil {
+                selection = .conversation
+            }
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if workspace.model.selectedThread == nil {
                     Button("New Thread", systemImage: "plus") { chooseRepository(for: .new) }
                         .tint(LeChatonTheme.orange)
+                        .disabled(!workspace.canCreateThread)
                         .help("Create a Thread in a Git repository")
                 } else {
                     Button("Replace Thread", systemImage: "arrow.triangle.2.circlepath") {
                         chooseRepository(for: .replace)
                     }
-                    .disabled(!canReplace)
+                    .disabled(!workspace.canReplaceThread)
                     .help("Replace the saved Thread")
 
                     Menu("Thread Actions", systemImage: "ellipsis.circle") {
@@ -46,6 +52,7 @@ struct WorkspaceRootView: View {
                         Button("Remove Saved Thread…", role: .destructive) {
                             confirmsRemoval = true
                         }
+                        .disabled(!workspace.canRemoveThread)
                     }
                     .menuIndicator(.hidden)
                     .help("Thread actions")
@@ -95,7 +102,6 @@ struct WorkspaceRootView: View {
         ) {
             if let trustStatus {
                 RepositoryTrustSheet(workspace: workspace, status: trustStatus)
-                    .interactiveDismissDisabled()
             }
         }
         .confirmationDialog(
@@ -150,10 +156,6 @@ struct WorkspaceRootView: View {
         }
     }
 
-    private var canReplace: Bool {
-        workspace.model.lifecycle == .unloaded || workspace.model.lifecycle == .idle
-    }
-
     private var canResetRuntime: Bool {
         switch workspace.model.lifecycle {
         case .idle, .unloaded, .failed, .reloadRequired: true
@@ -167,6 +169,14 @@ struct WorkspaceRootView: View {
     }
 
     private func chooseRepository(for mode: ThreadCreationMode) {
+        switch mode {
+        case .new where !workspace.canCreateThread:
+            return
+        case .replace where !workspace.canReplaceThread:
+            return
+        default:
+            break
+        }
         guard let repositoryURL = SystemPickers.chooseRepository() else { return }
         threadDraft = ThreadCreationDraft(
             mode: mode,
@@ -196,6 +206,6 @@ private struct RecoveryBackupBanner: View {
         .glassEffect(.regular, in: .rect(cornerRadius: 10))
         .padding(.horizontal, 8)
         .padding(.top, 6)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }

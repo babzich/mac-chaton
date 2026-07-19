@@ -10,14 +10,9 @@ let sharedSettings: Settings = .settings(
     ]
 )
 
-let appSettings: Settings = .settings(
+let appTargetSettings: Settings = .settings(
     base: [
-        "ARCHS": "arm64",
         "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
-        "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path @executable_path/Frameworks",
-        "ONLY_ACTIVE_ARCH": "YES",
-        "SWIFT_STRICT_CONCURRENCY": "complete",
-        "SWIFT_VERSION": "6.0",
     ]
 )
 
@@ -40,8 +35,7 @@ let project = Project(
             sources: ["Sources/LeChatonCore/**"],
             dependencies: [
                 .external(name: "GRDB"),
-            ],
-            settings: sharedSettings
+            ]
         ),
         .target(
             name: "LeChaton",
@@ -61,7 +55,7 @@ let project = Project(
             dependencies: [
                 .target(name: "LeChatonCore"),
             ],
-            settings: appSettings
+            settings: appTargetSettings
         ),
         .target(
             name: "ACPProbe",
@@ -70,11 +64,13 @@ let project = Project(
             bundleId: "com.vincentbach.ACPProbe",
             deploymentTargets: .macOS("26.0"),
             infoPlist: .default,
-            sources: ["Sources/ACPProbe/**"],
+            sources: [
+                "Sources/ACPProbe/**",
+                "Sources/ACPProbeSupport/**",
+            ],
             dependencies: [
                 .target(name: "LeChatonCore"),
-            ],
-            settings: sharedSettings
+            ]
         ),
         .target(
             name: "FakeACPAgent",
@@ -86,8 +82,7 @@ let project = Project(
             sources: ["Sources/FakeACPAgent/**"],
             dependencies: [
                 .target(name: "LeChatonCore"),
-            ],
-            settings: sharedSettings
+            ]
         ),
         .target(
             name: "LeChatonTests",
@@ -96,12 +91,14 @@ let project = Project(
             bundleId: "com.vincentbach.LeChatonTests",
             deploymentTargets: .macOS("26.0"),
             infoPlist: .default,
-            sources: ["Tests/LeChatonTests/**"],
+            sources: [
+                "Tests/LeChatonTests/**",
+                "Sources/ACPProbeSupport/**",
+            ],
             dependencies: [
                 .target(name: "LeChatonCore"),
                 .target(name: "FakeACPAgent"),
-            ],
-            settings: sharedSettings
+            ]
         ),
     ],
     schemes: [

@@ -129,9 +129,7 @@ actor LiveSessionRuntime: SessionRuntime {
     }
 
     func respondToPermissionCancellation(id: RPCID) async throws {
-        try await transport.respond(id: id, result: .object([
-            "outcome": .object(["outcome": .string("cancelled")]),
-        ]))
+        try await transport.respondToPermissionCancellation(id: id)
     }
 
     func cancelPrompt(sessionID: String) async throws -> Bool {
@@ -149,6 +147,9 @@ actor LiveSessionRuntime: SessionRuntime {
 
 public protocol SessionAuthenticationOwner: Actor {
     func refresh() async throws -> VibeAuthenticationSnapshot
+    func startDelegatedAuthentication() async throws -> VibeDelegatedAuthenticationAttempt
+    func completeDelegatedAuthentication(attemptID: String) async throws -> VibeAuthenticationStatus
+    func pendingDelegatedAuthentication() -> VibeDelegatedAuthenticationAttempt?
     func dispose() async throws -> ProcessCleanupReport?
     func retryCleanup() async throws -> ProcessCleanupReport?
 }
@@ -254,6 +255,7 @@ public struct SessionPersistenceClient: Sendable {
 
 public struct SessionModelDependencies: Sendable {
     public var persistence: SessionPersistenceClient
+    public var validateRepository: @Sendable (URL) async throws -> CanonicalRepository
     public var locateExecutable: @Sendable (String?) throws -> VibeExecutable
     public var validateExecutable: @Sendable (URL) throws -> VibeExecutable
     public var makeRuntime: @Sendable (VibeExecutable, URL) -> any SessionRuntime
@@ -263,6 +265,9 @@ public struct SessionModelDependencies: Sendable {
 
     public init(
         persistence: SessionPersistenceClient,
+        validateRepository: @escaping @Sendable (URL) async throws -> CanonicalRepository = {
+            try await RepositoryValidator().validate($0)
+        },
         locateExecutable: @escaping @Sendable (String?) throws -> VibeExecutable,
         validateExecutable: @escaping @Sendable (URL) throws -> VibeExecutable,
         makeRuntime: @escaping @Sendable (VibeExecutable, URL) -> any SessionRuntime,
@@ -271,6 +276,7 @@ public struct SessionModelDependencies: Sendable {
         makeUUID: @escaping @Sendable () -> UUID = { UUID() }
     ) {
         self.persistence = persistence
+        self.validateRepository = validateRepository
         self.locateExecutable = locateExecutable
         self.validateExecutable = validateExecutable
         self.makeRuntime = makeRuntime

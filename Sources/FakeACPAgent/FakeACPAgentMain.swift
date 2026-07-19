@@ -13,8 +13,10 @@ struct FakeACPAgentMain {
         var descendantProcess: Process?
         var model = "fake-model"
         var authenticated = true
+        var authenticationStatusRequestCount = 0
         var pendingAuthenticationAttemptID: String?
         var workspaceTrusted = false
+        var stopReadingStandardInput = false
     }
 
     static func main() {
@@ -36,6 +38,9 @@ struct FakeACPAgentMain {
             do {
                 let message = try JSONRPCMessage.decode(line: data)
                 try handle(message, state: &state)
+                if state.stopReadingStandardInput {
+                    while true { pause() }
+                }
             } catch {
                 write(.object([
                     "jsonrpc": .string("2.0"),
@@ -85,8 +90,18 @@ struct FakeACPAgentMain {
                 if state.scenario == "malformed" {
                     FileHandle.standardOutput.write(Data("{not-json}\n".utf8))
                 }
+                if state.scenario == "stdin-backpressure" {
+                    state.stopReadingStandardInput = true
+                }
 
             case "_auth/status":
+                if state.scenario == "no-auth-response" { return }
+                state.authenticationStatusRequestCount += 1
+                if state.scenario == "auth-drops-before-promotion",
+                   state.authenticationStatusRequestCount > 1
+                {
+                    state.authenticated = false
+                }
                 let status: JSONValue
                 if state.scenario == "auth-legacy-status" {
                     status = .object([
@@ -210,6 +225,7 @@ struct FakeACPAgentMain {
                 write(JSONRPCMessage.response(id: request.id, result: sessionResult(state: state)))
 
             case "session/load":
+                if state.scenario == "no-load-response" { return }
                 if let requestedID = request.params?["sessionId"]?.stringValue { state.sessionID = requestedID }
                 if state.scenario == "malformed-load-response" {
                     write(JSONRPCMessage.response(id: request.id, result: .object([
@@ -284,6 +300,7 @@ struct FakeACPAgentMain {
                 }
 
             case "session/set_config_option":
+                if state.scenario == "no-config-response" { return }
                 if let value = request.params?["value"]?.stringValue { state.model = value }
                 if state.scenario == "config-empty-response" {
                     write(JSONRPCMessage.response(id: request.id, result: .object([:])))
