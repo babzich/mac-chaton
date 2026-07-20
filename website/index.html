@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="An expert field manual for Vibe CLI, Agent Client Protocol, Codex, Pi, and the architecture behind coding agents."
+    />
+    <title>Agent Field Manual — Vibe, ACP & Coding Agents</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <aside class="sidebar" aria-label="Course navigation">
+      <a class="brand" href="#top" aria-label="Agent Field Manual home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 44 44" role="img">
+            <path d="M8 14 14 7l5 7h6l5-7 6 7v16c0 4-3 7-7 7H15c-4 0-7-3-7-7V14Z" />
+            <path d="M15 23h3m8 0h3m-12 7h10" />
+          </svg>
+        </span>
+        <span><strong>Agent</strong><small>field manual</small></span>
+      </a>
+
+      <nav class="chapter-nav">
+        <p class="nav-label">Curriculum</p>
+        <a href="#model" data-nav="model"><span>01</span>Mental model</a>
+        <a href="#vibe" data-nav="vibe"><span>02</span>Vibe CLI</a>
+        <a href="#acp" data-nav="acp"><span>03</span>ACP wire</a>
+        <a href="#anatomy" data-nav="anatomy"><span>04</span>Harness engineering</a>
+        <a href="#landscape" data-nav="landscape"><span>05</span>Codex & Pi</a>
+        <a href="#lechaton" data-nav="lechaton"><span>06</span>Build LeChaton</a>
+        <a href="#labs" data-nav="labs"><span>07</span>Expert labs</a>
+        <a href="#exam" data-nav="exam"><span>08</span>Field exam</a>
+      </nav>
+
+      <div class="sidebar-progress">
+        <div class="progress-heading">
+          <span>Your fieldwork</span>
+          <strong id="course-progress-label">0%</strong>
+        </div>
+        <div class="progress-track" aria-hidden="true">
+          <span id="course-progress-bar"></span>
+        </div>
+        <small><span id="completed-count">0</span> / 8 labs completed</small>
+      </div>
+    </aside>
+
+    <main id="main-content">
+      <header class="topbar" id="top">
+        <div class="crumb"><span class="status-dot"></span>LeChaton learning companion</div>
+        <div class="top-actions">
+          <button class="command-button" id="open-command" type="button" aria-haspopup="dialog">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+            Search manual
+            <kbd>⌘ K</kbd>
+          </button>
+          <button class="icon-button" id="theme-toggle" type="button" aria-label="Switch color theme">
+            <svg class="sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <section class="hero section-shell" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow"><span>FIELD MANUAL 01</span> VIBE 2.21.0 · ACP V1</p>
+          <h1 id="hero-title">Master the machine<br />behind the <em>magic.</em></h1>
+          <p class="hero-intro">
+            Learn the agent loop, inspect the wire, compare the leading harnesses, and turn protocol facts into a resilient native client.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#model">Start the curriculum <span>↘</span></a>
+            <a class="button button-quiet" href="#acp">Open the wire lab</a>
+          </div>
+          <div class="hero-proof" aria-label="Curriculum coverage">
+            <div><strong>08</strong><span>expert chapters</span></div>
+            <div><strong>08</strong><span>hands-on labs</span></div>
+            <div><strong>04</strong><span>systems compared</span></div>
+          </div>
+        </div>
+
+        <div class="hero-visual" aria-label="Agent loop visualization">
+          <div class="visual-label"><span>LIVE MENTAL MODEL</span><span class="pulse"></span></div>
+          <div class="orbit orbit-one"></div>
+          <div class="orbit orbit-two"></div>
+          <div class="core-node">
+            <span class="core-glyph">↻</span>
+            <strong>AGENT<br />LOOP</strong>
+          </div>
+          <div class="satellite satellite-a"><span>01</span>context</div>
+          <div class="satellite satellite-b"><span>02</span>model</div>
+          <div class="satellite satellite-c"><span>03</span>tool</div>
+          <div class="satellite satellite-d"><span>04</span>result</div>
+          <div class="terminal-float">
+            <div class="terminal-chrome"><i></i><i></i><i></i><span>vibe-acp</span></div>
+            <code><b>→</b> session/prompt<br /><b>←</b> session/update <i>× 14</i><br /><b>→</b> permission/result<br /><b>←</b> stop: end_turn</code>
+          </div>
+        </div>
+      </section>
+
+      <section class="version-strip" aria-label="Version scope">
+        <span class="version-badge">SCOPE LOCK</span>
+        <p><strong>Build contract:</strong> ACP protocol 1 + Vibe 2.21.0. Current upstream docs are useful for CLI fluency, but only the pinned live gate defines LeChaton compatibility.</p>
+        <a href="../docs/compatibility/vibe-2.21.0-live-gate.md">Read the evidence ↗</a>
+      </section>
+
+      <section class="content-section" id="model" data-section>
+        <div class="section-kicker"><span>01</span> Mental model</div>
+        <div class="section-heading split-heading">
+          <div>
+            <h2>First, separate the layers.</h2>
+            <p>Most confusion comes from calling every layer “the agent.” Experts name the owner, boundary, and failure mode precisely.</p>
+          </div>
+          <p class="margin-note">Click a layer to inspect its responsibility and the question it answers.</p>
+        </div>
+
+        <div class="stack-explorer">
+          <div class="stack-layers" role="tablist" aria-label="Coding agent layers">
+            <button class="stack-layer is-active" type="button" role="tab" aria-selected="true" data-layer="surface"><span>07</span><strong>Surface</strong><small>TUI · IDE · native app</small></button>
+            <button class="stack-layer" type="button" role="tab" aria-selected="false" data-layer="protocol"><span>06</span><strong>Protocol</strong><small>ACP · app-server · RPC</small></button>
+            <button class="stack-layer" type="button" role="tab" aria-selected="false" data-layer="runtime"><span>05</span><strong>Runtime</strong><small>process · session · turn</small></button>
+            <button class="stack-layer" type="button" role="tab" aria-selected="false" data-layer="orchestrator"><span>04</span><strong>Orchestrator</strong><small>agent loop · compaction</small></button>
+            <button class="stack-layer" type="button" role="tab" aria-selected="false" data-layer="tools"><span>03</span><strong>Tools</strong><small>shell · files · MCP</small></button>
+            <button class="stack-layer" type="button" role="tab" aria-selected="false" data-layer="provider"><span>02</span><strong>Provider</strong><small>API · auth · model catalog</small></button>
+            <button class="stack-layer" type="button" role="tab" aria-selected="false" data-layer="model"><span>01</span><strong>Model</strong><small>tokens · reasoning · tool intent</small></button>
+          </div>
+          <article class="layer-detail" id="layer-detail" aria-live="polite">
+            <p class="detail-index">LAYER 07 / USER BOUNDARY</p>
+            <h3>The surface is not the agent.</h3>
+            <p>A terminal UI, editor panel, or SwiftUI app captures intent and renders state. It may own permission UX and process lifecycle, while the agent lives behind a protocol boundary.</p>
+            <dl>
+              <div><dt>Owns</dt><dd>Input, navigation, rendering, user decisions</dd></div>
+              <div><dt>Asks</dt><dd>What must the human see, decide, or recover?</dd></div>
+              <div><dt>LeChaton</dt><dd>SwiftUI views + app-owned controllers</dd></div>
+            </dl>
+          </article>
+        </div>
+
+        <div class="concept-grid">
+          <article class="concept-card concept-lead">
+            <span class="concept-number">A</span>
+            <h3>The universal agent loop</h3>
+            <ol class="loop-list">
+              <li><span>1</span>Assemble instructions, history, files, and tool schemas into model context.</li>
+              <li><span>2</span>Ask the model for the next response; stream text, reasoning, or tool intent.</li>
+              <li><span>3</span>Authorize and execute tool calls in the runtime’s environment.</li>
+              <li><span>4</span>Append tool results to context and call the model again.</li>
+              <li><span>5</span>Stop on a terminal response, limit, refusal, cancellation, or error.</li>
+            </ol>
+          </article>
+          <article class="concept-card">
+            <span class="concept-number">B</span>
+            <h3>Three nested lifetimes</h3>
+            <div class="lifetime-diagram">
+              <div><strong>Process</strong><span>owns pipes, cwd, env, descendants</span>
+                <div><strong>Session</strong><span>owns history and configuration</span>
+                  <div><strong>Turn</strong><span>one prompt → stop reason</span></div>
+                </div>
+              </div>
+            </div>
+          </article>
+          <article class="concept-card accent-card">
+            <span class="concept-number">C</span>
+            <h3>ACP ≠ MCP</h3>
+            <p><strong>ACP connects a user-facing client to a coding agent.</strong> MCP connects a model or agent to external tools and data. An ACP client can hand MCP server definitions to the agent—two boundaries, two trust models.</p>
+            <div class="mini-flow"><span>LeChaton</span><b>ACP</b><span>Vibe</span><b>MCP</b><span>Service</span></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="content-section section-tint" id="vibe" data-section>
+        <div class="section-kicker"><span>02</span> Vibe CLI</div>
+        <div class="section-heading">
+          <h2>One engine, three operating modes.</h2>
+          <p>Vibe is an agent harness. The interactive CLI, programmatic CLI, and ACP executable expose that harness to different clients.</p>
+        </div>
+
+        <div class="mode-switcher" role="tablist" aria-label="Vibe operating modes">
+          <button class="mode-tab is-active" type="button" data-mode="interactive" aria-selected="true"><span>01</span>Interactive</button>
+          <button class="mode-tab" type="button" data-mode="programmatic" aria-selected="false"><span>02</span>Programmatic</button>
+          <button class="mode-tab" type="button" data-mode="acp-mode" aria-selected="false"><span>03</span>ACP server</button>
+        </div>
+        <article class="mode-panel" id="mode-panel" aria-live="polite">
+          <div>
+            <p class="panel-tag">HUMAN ↔ TUI ↔ VIBE</p>
+            <h3>Use it to think with the codebase.</h3>
+            <p>Run <code>vibe</code> inside a repository. The TUI owns input, slash commands, file references, tool previews, approvals, and session navigation.</p>
+            <ul class="check-list">
+              <li><code>@path</code> adds a file to the prompt.</li>
+              <li><code>!command</code> runs a shell command directly.</li>
+              <li><code>Shift+Tab</code> cycles agent profiles.</li>
+              <li><code>Escape</code> interrupts current work.</li>
+            </ul>
+          </div>
+          <div class="code-window">
+            <div class="code-title"><span>TERMINAL</span><button type="button" class="copy-code" data-copy="cd /path/to/repo\nvibe --agent plan">Copy</button></div>
+            <pre><code><span class="muted"># Explore safely first</span>
+$ vibe --agent plan
+
+<span class="prompt">›</span> Trace authentication from UI to storage.
+<span class="prompt">›</span> @Sources/LeChatonCore/Vibe/VibeAdapter.swift
+<span class="prompt">›</span> !git status --short</code></pre>
+          </div>
+        </article>
+
+        <div class="cli-grid">
+          <article>
+            <p class="card-label">CONTEXT INPUTS</p>
+            <h3>What the model actually sees</h3>
+            <p>System prompt + active agent profile + global/project instructions + selected skills + conversation + referenced files + tool schemas + tool results. The repository is not magically “inside” the model; the harness selects and injects context.</p>
+          </article>
+          <article>
+            <p class="card-label">SAFETY PROFILE</p>
+            <h3>Approval is policy, not intelligence</h3>
+            <p><code>default</code> asks before tools, <code>plan</code> favors read-only work, <code>accept-edits</code> auto-approves edits, and <code>auto-approve</code> removes prompts. The model proposes; the runtime policy decides whether execution may happen.</p>
+          </article>
+          <article>
+            <p class="card-label">DURABLE CUSTOMIZATION</p>
+            <h3>Config, agents, skills, MCP</h3>
+            <p><code>~/.vibe/config.toml</code> provides user defaults; <code>.vibe/</code> can add project-local configuration after trust; agents package behavior and tool policy; skills add workflows; MCP servers add external tools.</p>
+          </article>
+        </div>
+
+        <div class="command-atlas">
+          <div class="atlas-heading">
+            <div><p class="card-label">PINNED BINARY / LOCAL HELP</p><h3>Vibe 2.21.0 command atlas</h3></div>
+            <span>verified on this machine</span>
+          </div>
+          <div class="command-list">
+            <div><code>vibe</code><span>Open the interactive terminal UI in the current directory.</span></div>
+            <div><code>vibe -p "…" --max-turns 5</code><span>Run one bounded programmatic task and exit.</span></div>
+            <div><code>vibe -p "…" --output streaming</code><span>Emit newline-delimited message events for automation.</span></div>
+            <div><code>vibe --agent plan</code><span>Start with the read-oriented planning profile.</span></div>
+            <div><code>vibe --enabled-tools read_file</code><span>Restrict the programmatic tool surface.</span></div>
+            <div><code>vibe --continue</code><span>Continue the most recently saved session.</span></div>
+            <div><code>vibe --resume SESSION_ID</code><span>Resume a specific persisted session.</span></div>
+            <div><code>vibe-acp</code><span>Run the agent as an ACP process over stdin/stdout.</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="content-section dark-section" id="acp" data-section>
+        <div class="section-kicker"><span>03</span> ACP wire</div>
+        <div class="section-heading split-heading">
+          <div>
+            <h2>ACP is a conversation between programs.</h2>
+            <p>JSON-RPC 2.0 envelopes travel over stdin/stdout. Both peers can initiate work: the client prompts the agent; the agent can request a permission decision from the client.</p>
+          </div>
+          <div class="protocol-pill"><i></i> protocolVersion <strong>1</strong></div>
+        </div>
+
+        <div class="wire-lab">
+          <div class="wire-toolbar">
+            <div><span class="live-dot"></span>WIRE LAB</div>
+            <p>Follow one complete turn</p>
+            <span id="wire-counter">01 / 07</span>
+          </div>
+          <div class="wire-stage">
+            <div class="peer peer-client"><span>CLIENT</span><strong>LeChaton</strong><small>UI + lifecycle owner</small></div>
+            <div class="wire-channel">
+              <span class="wire-packet" id="wire-packet">initialize →</span>
+              <div class="wire-line"></div>
+            </div>
+            <div class="peer peer-agent"><span>AGENT</span><strong>vibe-acp</strong><small>agent + tool runtime</small></div>
+          </div>
+          <div class="wire-body">
+            <div class="wire-steps" role="tablist" aria-label="ACP lifecycle steps">
+              <button class="wire-step is-active" type="button" data-wire="initialize"><span>01</span><strong>Initialize</strong><small>negotiate capabilities</small></button>
+              <button class="wire-step" type="button" data-wire="new"><span>02</span><strong>New / load</strong><small>obtain a session</small></button>
+              <button class="wire-step" type="button" data-wire="prompt"><span>03</span><strong>Prompt</strong><small>start one turn</small></button>
+              <button class="wire-step" type="button" data-wire="stream"><span>04</span><strong>Updates</strong><small>stream UI state</small></button>
+              <button class="wire-step" type="button" data-wire="permission"><span>05</span><strong>Permission</strong><small>bidirectional request</small></button>
+              <button class="wire-step" type="button" data-wire="complete"><span>06</span><strong>Complete</strong><small>receive stop reason</small></button>
+              <button class="wire-step" type="button" data-wire="cancel"><span>07</span><strong>Cancel</strong><small>interrupt + clean up</small></button>
+            </div>
+            <article class="wire-inspector">
+              <div class="inspector-heading"><span id="wire-direction">CLIENT → AGENT · REQUEST</span><button type="button" class="copy-code" id="copy-wire">Copy JSON</button></div>
+              <pre id="wire-json" aria-live="polite"></pre>
+              <div class="wire-rule">
+                <span>THE RULE</span>
+                <p id="wire-rule-text">Initialization must be the first ACP request. Negotiate the protocol version and inspect capabilities before using optional methods.</p>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <div class="protocol-principles">
+          <article><span>01</span><h3>Requests correlate</h3><p>A request has an <code>id</code>. Exactly one response returns the same ID with either <code>result</code> or <code>error</code>.</p></article>
+          <article><span>02</span><h3>Notifications stream</h3><p>A notification has a <code>method</code> but no ID. <code>session/update</code> carries message chunks, reasoning, tools, plans, and metadata.</p></article>
+          <article><span>03</span><h3>Capabilities gate</h3><p>Protocol version answers “same wire language?” Capabilities answer “which optional verbs and shapes may I use?” Check both.</p></article>
+          <article><span>04</span><h3>Extensions isolate</h3><p>Vendor methods such as Vibe authentication and trust belong behind an adapter. Generic ACP types should not learn vendor policy.</p></article>
+        </div>
+
+        <article class="ordering-case">
+          <div class="case-copy">
+            <p class="card-label">THE REPLAY TRAP / VIBE 2.21.0</p>
+            <h3>The response is not the history.</h3>
+            <p>During <code>session/load</code>, Vibe can emit replayed <code>session/update</code> notifications before returning the load response. A client that waits for the response before consuming stdout can lose or misorder history.</p>
+            <ul class="check-list inverted">
+              <li>Start one permanent, lossless read loop before session requests.</li>
+              <li>Stage history off-screen and reduce updates serially.</li>
+              <li>Capture a replay barrier at the load response.</li>
+              <li>Publish only after every earlier sequence is reduced.</li>
+            </ul>
+          </div>
+          <div class="sequence-card" aria-label="Load replay sequence">
+            <div class="sequence-head"><span>CLIENT</span><span>VIBE</span></div>
+            <div class="sequence-row right"><span>session/load</span><i>1</i></div>
+            <div class="sequence-row left"><span>update · message</span><i>2</i></div>
+            <div class="sequence-row left"><span>update · reasoning</span><i>3</i></div>
+            <div class="sequence-row left"><span>update · tool</span><i>4</i></div>
+            <div class="sequence-row left response"><span>load result + barrier(4)</span><i>5</i></div>
+            <div class="sequence-row local"><span>reduce through 4 → publish</span><i>✓</i></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="content-section" id="anatomy" data-section>
+        <div class="section-kicker"><span>04</span> Harness engineering</div>
+        <div class="section-heading">
+          <h2>Trace a prompt from keystroke to commit.</h2>
+          <p>The most useful architecture view is ownership: who holds state, who may mutate the world, and who must recover when something dies?</p>
+        </div>
+
+        <div class="anatomy-map">
+          <div class="anatomy-column">
+            <p class="map-label">PRESENTATION</p>
+            <article><span>01</span><div><strong>Input composer</strong><small>text, attachments, steering, cancel</small></div></article>
+            <article><span>02</span><div><strong>Transcript reducer</strong><small>turn events → renderable state</small></div></article>
+            <article><span>03</span><div><strong>Permission UI</strong><small>human decision → exact request ID</small></div></article>
+          </div>
+          <div class="map-arrows" aria-hidden="true"><i>→</i><i>←</i><i>→</i></div>
+          <div class="anatomy-column center-column">
+            <p class="map-label">CONTROL PLANE</p>
+            <article><span>04</span><div><strong>Session model</strong><small>lifecycle + current generation</small></div></article>
+            <article><span>05</span><div><strong>Transport</strong><small>framing, correlation, sequencing</small></div></article>
+            <article><span>06</span><div><strong>Persistence</strong><small>metadata, not duplicated transcript</small></div></article>
+          </div>
+          <div class="map-arrows" aria-hidden="true"><i>→</i><i>←</i><i>→</i></div>
+          <div class="anatomy-column">
+            <p class="map-label">EXECUTION PLANE</p>
+            <article><span>07</span><div><strong>Agent process</strong><small>model loop + tool dispatch</small></div></article>
+            <article><span>08</span><div><strong>Tool processes</strong><small>shell + descendants + files</small></div></article>
+            <article><span>09</span><div><strong>Provider</strong><small>authentication + inference stream</small></div></article>
+          </div>
+        </div>
+
+        <div class="expert-rules">
+          <div class="rule-intro"><span>NON-NEGOTIABLES</span><h3>Six rules for trustworthy clients</h3></div>
+          <ol>
+            <li><strong>One owner per mutable resource.</strong><span>Pipes, reducers, database handles, auth attempts, and process trees each need an explicit owner.</span></li>
+            <li><strong>Events need identity and order.</strong><span>Correlate runtime generation, load attempt, sequence, session, message, and tool IDs.</span></li>
+            <li><strong>Rendering is not persistence.</strong><span>Know whether the agent or client is authoritative for history, configuration, and titles.</span></li>
+            <li><strong>Cancellation is a protocol plus cleanup.</strong><span>A cancel notification does not prove shell descendants are dead.</span></li>
+            <li><strong>Capabilities beat assumptions.</strong><span>Negotiate optional behavior and tolerate unknown enum values, fields, and notifications.</span></li>
+            <li><strong>Secrets move on narrow paths.</strong><span>Sanitize the environment, scope key injection, and never log credentials or completion payloads.</span></li>
+          </ol>
+        </div>
+
+        <div class="harness-intro">
+          <div>
+            <p class="card-label">FROM TOY LOOP TO PRODUCT</p>
+            <h3>A harness is a control system around an unreliable planner.</h3>
+          </div>
+          <p>The model is probabilistic. Your harness must make context, tools, side effects, budgets, events, and recovery deterministic enough to operate. The craft is not “calling an LLM”; it is designing every boundary around that call.</p>
+        </div>
+
+        <div class="harness-blueprint">
+          <div class="blueprint-grid" aria-label="Production harness component map">
+            <article class="bp-context"><span>01</span><strong>Context assembler</strong><small>instructions · history · files · tool schemas</small></article>
+            <article class="bp-provider"><span>02</span><strong>Provider adapter</strong><small>auth · request shape · deltas · usage</small></article>
+            <article class="bp-loop"><span>03</span><strong>Loop controller</strong><small>turns · budgets · stop conditions · steering</small></article>
+            <article class="bp-tools"><span>04</span><strong>Tool registry</strong><small>typed input · execution · normalized result</small></article>
+            <article class="bp-policy"><span>05</span><strong>Policy engine</strong><small>allow · ask · deny · sandbox profile</small></article>
+            <article class="bp-events"><span>06</span><strong>Event stream</strong><small>ordered facts · IDs · deltas · lifecycle</small></article>
+            <article class="bp-session"><span>07</span><strong>Session store</strong><small>append · branch · resume · compact</small></article>
+            <article class="bp-observe"><span>08</span><strong>Observability</strong><small>trace · token usage · latency · failures</small></article>
+            <article class="bp-client"><span>09</span><strong>Client boundary</strong><small>TUI · JSONL · RPC · ACP · SDK</small></article>
+          </div>
+          <div class="blueprint-legend">
+            <div><span class="legend-control"></span><strong>Control plane</strong><small>decides what may happen next</small></div>
+            <div><span class="legend-data"></span><strong>Data plane</strong><small>moves context and event facts</small></div>
+            <div><span class="legend-trust"></span><strong>Trust boundary</strong><small>crosses into side effects or secrets</small></div>
+          </div>
+        </div>
+
+        <div class="loop-implementation">
+          <article class="implementation-copy">
+            <p class="card-label">THE MINIMAL CORE</p>
+            <h3>Write the loop in 30 lines. Spend the rest of the project on invariants.</h3>
+            <p>The happy path is deliberately boring. Production complexity enters through partial streaming, retries, permission races, context limits, provider differences, tool processes, and crash recovery.</p>
+            <div class="invariant-list">
+              <div><span>I-01</span><p>Each accepted tool call produces at most one terminal tool result.</p></div>
+              <div><span>I-02</span><p>Every public event is ordered within a run and belongs to one session and turn.</p></div>
+              <div><span>I-03</span><p>No retry may duplicate a non-idempotent side effect without an explicit key or decision.</p></div>
+              <div><span>I-04</span><p>Context compaction preserves active goals, constraints, decisions, and unresolved tool work.</p></div>
+              <div><span>I-05</span><p>Cancellation stops future scheduling and eventually proves owned execution is gone.</p></div>
+            </div>
+          </article>
+          <div class="code-window harness-code">
+            <div class="code-title"><span>PSEUDOCODE / PROVIDER-NEUTRAL</span><button type="button" class="copy-code" data-copy="while budget.allows(state):\n  request = context.build(state, tools.schemas)\n  stream = provider.generate(request, signal)\n  decision = events.reduce(stream)\n\n  if decision.is_final:\n    return decision.output\n\n  for call in decision.tool_calls:\n    verdict = policy.authorize(call, scope)\n    result = tools.execute(call, verdict, signal)\n    state.append(result)\n\nreturn StopReason.budget_exhausted">Copy</button></div>
+            <pre><code><span class="keyword">while</span> budget.allows(state):
+  request = context.build(state, tools.schemas)
+  stream = provider.generate(request, signal)
+  decision = events.reduce(stream)
+
+  <span class="keyword">if</span> decision.is_final:
+    <span class="keyword">return</span> decision.output
+
+  <span class="keyword">for</span> call <span class="keyword">in</span> decision.tool_calls:
+    verdict = policy.authorize(call, scope)
+    result = tools.execute(call, verdict, signal)
+    state.append(result)
+
+<span class="keyword">return</span> StopReason.budget_exhausted</code></pre>
+          </div>
+        </div>
+
+        <div class="engineering-grid">
+          <article>
+            <span class="engineering-icon">CTX</span>
+            <h3>Context engineering</h3>
+            <p>Define precedence and token budgets. Keep durable instructions separate from task input. Retrieve files just in time. Preserve the user’s goal through compaction. Treat tool output as untrusted, high-volume input.</p>
+            <ul><li>instruction layering</li><li>retrieval policy</li><li>prompt-cache boundaries</li><li>compaction contract</li></ul>
+          </article>
+          <article>
+            <span class="engineering-icon">API</span>
+            <h3>Provider normalization</h3>
+            <p>Convert provider-specific streams into your own events. Do not let Anthropic content blocks, OpenAI response items, or Mistral deltas leak across the core. Preserve unknown fields for diagnostics.</p>
+            <ul><li>model capabilities</li><li>tool-call deltas</li><li>usage accounting</li><li>retry classification</li></ul>
+          </article>
+          <article>
+            <span class="engineering-icon">TLS</span>
+            <h3>Tool design</h3>
+            <p>A tool is a typed capability, not a shell-shaped escape hatch. Give it a narrow schema, explicit effect class, bounded output, stable call ID, timeout, cancellation path, and renderer-safe result.</p>
+            <ul><li>schema quality</li><li>idempotency</li><li>output truncation</li><li>effect annotations</li></ul>
+          </article>
+          <article>
+            <span class="engineering-icon">EVT</span>
+            <h3>Event architecture</h3>
+            <p>Emit semantic facts: turn started, text delta, tool proposed, permission requested, tool completed, usage updated, turn stopped. Keep transport frames private and make reducers replayable.</p>
+            <ul><li>monotonic sequence</li><li>correlation IDs</li><li>snapshot + replay</li><li>forward compatibility</li></ul>
+          </article>
+          <article>
+            <span class="engineering-icon">SEC</span>
+            <h3>Execution safety</h3>
+            <p>Layer model-visible guidance, deterministic policy, human approval, OS sandboxing, scoped credentials, and complete child-process ownership. No single layer substitutes for another.</p>
+            <ul><li>allow / ask / deny</li><li>workspace roots</li><li>network policy</li><li>secret routing</li></ul>
+          </article>
+          <article>
+            <span class="engineering-icon">EVAL</span>
+            <h3>Evals & observability</h3>
+            <p>Measure task outcome and trajectory quality. Store event traces without secrets. Track tool errors, retries, context growth, latency, cost, approval friction, cancellation success, and orphan processes.</p>
+            <ul><li>deterministic fixtures</li><li>trajectory assertions</li><li>live compatibility gates</li><li>regression corpus</li></ul>
+          </article>
+        </div>
+
+        <div class="build-order">
+          <div class="build-order-copy"><p class="card-label">BUILD ORDER</p><h3>The shortest credible path to your own harness</h3><p>Each milestone produces a usable boundary and a testable contract.</p></div>
+          <ol>
+            <li><span>01</span><div><strong>One provider, text only</strong><small>Record raw stream fixtures; normalize errors and usage.</small></div></li>
+            <li><span>02</span><div><strong>Typed tool loop</strong><small>Add one read-only tool, then one mutating tool with IDs and timeouts.</small></div></li>
+            <li><span>03</span><div><strong>Semantic event log</strong><small>Drive a plain terminal renderer entirely from replayable events.</small></div></li>
+            <li><span>04</span><div><strong>Policy + cancellation</strong><small>Prove allow/ask/deny paths and descendant cleanup under races.</small></div></li>
+            <li><span>05</span><div><strong>Sessions + compaction</strong><small>Resume after process death and test the preserved-goal contract.</small></div></li>
+            <li><span>06</span><div><strong>Second provider</strong><small>Use it to expose leaks in the adapter boundary—not to add a dropdown.</small></div></li>
+            <li><span>07</span><div><strong>External client protocol</strong><small>Publish events through JSONL, RPC, or ACP without coupling the core to UI.</small></div></li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="content-section section-tint" id="landscape" data-section>
+        <div class="section-kicker"><span>05</span> Codex, Pi & the landscape</div>
+        <div class="section-heading split-heading">
+          <div><h2>Same loop. Different product bets.</h2><p>Compare harnesses by boundary, safety, persistence, and extensibility—not by terminal colors or model benchmarks.</p></div>
+          <p class="margin-note">“Protocol” here means the embeddable client boundary, not the provider API used for inference.</p>
+        </div>
+
+        <div class="comparison-table-wrap" tabindex="0" aria-label="Coding agent comparison table">
+          <table class="comparison-table">
+            <thead><tr><th>Dimension</th><th><span class="product-dot vibe-dot"></span>Vibe 2.21</th><th><span class="product-dot codex-dot"></span>Codex</th><th><span class="product-dot pi-dot"></span>Pi</th><th><span class="product-dot acp-dot"></span>ACP itself</th></tr></thead>
+            <tbody>
+              <tr><th>What it is</th><td>Open-source coding-agent harness</td><td>Local + cloud coding-agent product</td><td>Minimal, extensible terminal harness</td><td>Interoperability protocol</td></tr>
+              <tr><th>Primary surfaces</th><td>TUI, programmatic CLI, ACP</td><td>TUI, IDE, desktop app, cloud</td><td>TUI, print/JSON, RPC, SDK</td><td>No UI of its own</td></tr>
+              <tr><th>Client boundary</th><td><strong>ACP v1</strong> over stdio</td><td>Codex app-server / SDK / CLI JSONL</td><td>Pi RPC mode or embedded SDK</td><td>JSON-RPC; stdio is the local default</td></tr>
+              <tr><th>Tool boundary</th><td>Built-in agent tools + MCP</td><td>Built-ins + MCP + plugins/apps</td><td>Built-ins + TypeScript extensions</td><td>Can pass MCP server definitions</td></tr>
+              <tr><th>Safety posture</th><td>Agent profiles + approval requests</td><td>OS sandbox + approval policy</td><td>Tool allowlists; gates/sandbox via extensions</td><td>Permission request primitive, not a sandbox</td></tr>
+              <tr><th>Session model</th><td>Vibe-owned persisted histories</td><td>Threads/turns across local and cloud surfaces</td><td>JSONL tree with branching</td><td>Session lifecycle; storage is agent-defined</td></tr>
+              <tr><th>Best lesson</th><td>Portable agent behind a standard client</td><td>Defense in depth and multi-surface control</td><td>Small core, explicit extension seams</td><td>Capability-driven client/agent decoupling</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="product-deep-dives">
+          <article class="product-card codex-card">
+            <div class="product-card-head"><span>CODEX</span><strong>Defense in depth</strong></div>
+            <p>Codex separates the model’s proposed actions from the local executor with an OS-enforced sandbox and a distinct approval policy. Its CLI exposes interactive and non-interactive modes; its app-server and SDK expose thread/turn events to richer clients.</p>
+            <ul>
+              <li><code>AGENTS.md</code> makes repository guidance durable.</li>
+              <li><code>config.toml</code> controls model, sandbox, approvals, MCP, and profiles.</li>
+              <li><code>codex exec --json</code> streams machine-readable thread and item events.</li>
+              <li>Codex can consume MCP servers and can itself run as an MCP server.</li>
+            </ul>
+            <a href="https://learn.chatgpt.com/docs/developer-commands?surface=cli" target="_blank" rel="noreferrer">Official CLI manual ↗</a>
+          </article>
+          <article class="product-card pi-card">
+            <div class="product-card-head"><span>PI</span><strong>Small core, wide seams</strong></div>
+            <p>Pi makes the harness legible: model adapter, four core tools, session tree, TUI, and extension hooks. It supports many providers and invites you to add permission gates, sandboxing, subagents, custom tools, UI, or remote execution as extensions.</p>
+            <ul>
+              <li>Sessions are append-only JSONL entries linked by <code>id</code> and <code>parentId</code>.</li>
+              <li>Interactive, print/JSON, RPC, and SDK modes share one core.</li>
+              <li>Extensions can intercept lifecycle events and replace tools or rendering.</li>
+              <li>Minimalism makes ownership easy to study—and safety your responsibility.</li>
+            </ul>
+            <a href="https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent" target="_blank" rel="noreferrer">Official repository ↗</a>
+          </article>
+        </div>
+
+        <div class="pattern-callout">
+          <span class="pattern-icon">✦</span>
+          <div><p class="card-label">THE TRANSFERABLE PATTERN</p><h3>A good client consumes events, not prose.</h3></div>
+          <p>Whether the boundary is ACP, Codex app-server, or Pi RPC, build a typed event pipeline: decode → validate → correlate → reduce → render → persist only the state you own.</p>
+        </div>
+      </section>
+
+      <section class="content-section" id="lechaton" data-section>
+        <div class="section-kicker"><span>06</span> Build LeChaton</div>
+        <div class="section-heading">
+          <h2>Map the theory to this codebase.</h2>
+          <p>LeChaton is already a compact case study in protocol engineering. Read it in the following order to connect wire behavior to user experience.</p>
+        </div>
+
+        <div class="codebase-map">
+          <div class="codebase-rail" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
+          <div class="codebase-items">
+            <article><span class="file-step">01</span><div><p>WIRE TYPES</p><h3>Learn the envelope before the runtime.</h3><a href="../Sources/LeChatonCore/ACP/JSONRPC.swift">JSONRPC.swift</a><a href="../Sources/LeChatonCore/ACP/SessionUpdate.swift">SessionUpdate.swift</a></div><code>bytes → JSONValue → typed message</code></article>
+            <article><span class="file-step">02</span><div><p>TRANSPORT OWNER</p><h3>Follow one request through correlation and streaming.</h3><a href="../Sources/LeChatonCore/ACP/ACPTransport.swift">ACPTransport.swift</a></div><code>request ID ↔ continuation</code></article>
+            <article><span class="file-step">03</span><div><p>VENDOR BOUNDARY</p><h3>See how Vibe-specific behavior stays out of ACP.</h3><a href="../Sources/LeChatonCore/Vibe/VibeAdapter.swift">VibeAdapter.swift</a></div><code>portable core + isolated extensions</code></article>
+            <article><span class="file-step">04</span><div><p>DETERMINISTIC STATE</p><h3>Watch unordered wire facts become stable UI state.</h3><a href="../Sources/LeChatonCore/Session/SessionReducer.swift">SessionReducer.swift</a><a href="../Sources/LeChatonCore/Session/SessionLifecycle.swift">SessionLifecycle.swift</a></div><code>event + state → next state</code></article>
+            <article><span class="file-step">05</span><div><p>APP COORDINATION</p><h3>Connect lifecycle decisions to the native workspace.</h3><a href="../Sources/LeChatonCore/Session/SessionModel.swift">SessionModel.swift</a><a href="../Sources/LeChaton/Stores/WorkspaceController.swift">WorkspaceController.swift</a></div><code>runtime → @MainActor → SwiftUI</code></article>
+            <article><span class="file-step">06</span><div><p>EVIDENCE</p><h3>Prove assumptions at the process boundary.</h3><a href="../Sources/ACPProbe/ProbeRuntime.swift">ACPProbe</a><a href="../Tests/LeChatonTests/ACP/ACPTransportTests.swift">Transport tests</a></div><code>fake first · live only by intent</code></article>
+          </div>
+        </div>
+
+        <div class="failure-heading"><p class="card-label">VIBE 2.21.0 / INTEGRATION TRAPS</p><h3>Memorize the seven constraints that shape the app.</h3></div>
+        <div class="failure-grid">
+          <article><span>VACP-001</span><h4>Process-global cwd</h4><p>Do not multiplex active repositories through one Vibe process. Use one session process per active Thread.</p></article>
+          <article><span>VACP-002</span><h4>Shared configuration</h4><p>Model and thinking are Vibe-home-wide in the pinned release, not honestly thread-local.</p></article>
+          <article><span>VACP-003</span><h4>Process-bound auth</h4><p>Delegated browser auth must start and complete on the same live ACP process.</p></article>
+          <article><span>VACP-004</span><h4>Vendor auth methods</h4><p>Authentication and repository trust use Vibe extensions. Keep them behind the adapter.</p></article>
+          <article><span>VACP-005</span><h4>Replay before response</h4><p><code>session/update</code> history can arrive before <code>session/load</code> returns.</p></article>
+          <article><span>VACP-006</span><h4>Vibe hosts tools</h4><p>LeChaton observes and authorizes tools; it does not host filesystem or shell capabilities.</p></article>
+          <article><span>VACP-007</span><h4>New is not durable</h4><p>A <code>session/new</code> ID becomes durable only after a visible prompt and exact <code>session/list</code> confirmation.</p></article>
+          <article class="failure-link"><span>LIVE REGISTER</span><h4>Risks evolve.</h4><p>Read confirmed constraints separately from hypotheses that still need validation.</p><a href="../docs/vibe-acp-issues.md">Open issue register ↗</a></article>
+        </div>
+      </section>
+
+      <section class="content-section section-tint" id="labs" data-section>
+        <div class="section-kicker"><span>07</span> Expert labs</div>
+        <div class="section-heading split-heading">
+          <div><h2>Expertise comes from prediction.</h2><p>Before each lab, write down what you expect to happen. Then gather evidence and explain any mismatch.</p></div>
+          <button class="button button-quiet reset-progress" id="reset-labs" type="button">Reset lab progress</button>
+        </div>
+
+        <div class="lab-list">
+          <article class="lab-card" data-lab="loop">
+            <button class="lab-check" type="button" aria-label="Mark Agent loop autopsy complete"><span>✓</span></button>
+            <div class="lab-index">LAB 01 · 20 MIN</div><div class="lab-copy"><h3>Agent loop autopsy</h3><p>Run Vibe on a tiny disposable Git repository. Record each model response, tool call, tool result, and stop condition. Draw the loop without naming the UI.</p><span>Deliverable: one annotated turn trace</span></div><b>FOUNDATION</b>
+          </article>
+          <article class="lab-card" data-lab="cli">
+            <button class="lab-check" type="button" aria-label="Mark CLI modes complete"><span>✓</span></button>
+            <div class="lab-index">LAB 02 · 25 MIN</div><div class="lab-copy"><h3>Three faces of Vibe</h3><p>Perform the same read-only task in interactive mode, programmatic streaming mode, and through the ACP probe. Compare framing, approval, and termination.</p><span>Deliverable: a mode comparison table</span></div><b>VIBE</b>
+          </article>
+          <article class="lab-card" data-lab="handshake">
+            <button class="lab-check" type="button" aria-label="Mark Handshake decoder complete"><span>✓</span></button>
+            <div class="lab-index">LAB 03 · 35 MIN</div><div class="lab-copy"><h3>Handshake decoder</h3><p>Use the FakeACPAgent to inspect initialization. List protocol version, agent info, session capabilities, auth methods, and every choice gated by them.</p><span>Deliverable: capability decision matrix</span></div><b>ACP</b>
+          </article>
+          <article class="lab-card" data-lab="replay">
+            <button class="lab-check" type="button" aria-label="Mark Replay race complete"><span>✓</span></button>
+            <div class="lab-index">LAB 04 · 45 MIN</div><div class="lab-copy"><h3>Replay race reconstruction</h3><p>Read the replay tests, then diagram generation, load attempt, sequence, barrier, staging reducer, and publication. Explain one bug each identifier prevents.</p><span>Deliverable: failure-oriented sequence diagram</span></div><b>CONCURRENCY</b>
+          </article>
+          <article class="lab-card" data-lab="permission">
+            <button class="lab-check" type="button" aria-label="Mark Permission race complete"><span>✓</span></button>
+            <div class="lab-index">LAB 05 · 45 MIN</div><div class="lab-copy"><h3>Permission vs cancellation</h3><p>Trace the race between a queued permission request and cancellation. Prove why each request receives exactly one resolution and how late requests are handled.</p><span>Deliverable: race table with winning transitions</span></div><b>SAFETY</b>
+          </article>
+          <article class="lab-card" data-lab="compare">
+            <button class="lab-check" type="button" aria-label="Mark Harness comparison complete"><span>✓</span></button>
+            <div class="lab-index">LAB 06 · 60 MIN</div><div class="lab-copy"><h3>Harness comparison</h3><p>Run one task in Vibe, Codex, and Pi. Hold the model and repository constant if possible. Compare context construction, events, safety, persistence, and extension seams.</p><span>Deliverable: architecture comparison, not a benchmark</span></div><b>LANDSCAPE</b>
+          </article>
+          <article class="lab-card" data-lab="provider">
+            <button class="lab-check" type="button" aria-label="Mark Provider adapter contract complete"><span>✓</span></button>
+            <div class="lab-index">LAB 07 · 90 MIN</div><div class="lab-copy"><h3>Provider adapter contract</h3><p>Record fixtures from two providers for text, reasoning, a streamed tool call, usage, rate limiting, and cancellation. Normalize them into one internal event vocabulary without losing diagnostics.</p><span>Deliverable: adapter interface + fixture-driven contract tests</span></div><b>HARNESS</b>
+          </article>
+          <article class="lab-card" data-lab="harness">
+            <button class="lab-check" type="button" aria-label="Mark Build a vertical slice complete"><span>✓</span></button>
+            <div class="lab-index">LAB 08 · 3–5 HR</div><div class="lab-copy"><h3>Build a vertical slice</h3><p>Create a provider-neutral harness with one provider, a read tool, a mutating tool, allow/ask/deny policy, ordered JSONL events, cancellation, token budgets, and a plain terminal renderer driven only by replayed events.</p><span>Deliverable: working harness + ten explicit invariants + failure tests</span></div><b>MASTERY</b>
+          </article>
+        </div>
+      </section>
+
+      <section class="content-section exam-section" id="exam" data-section>
+        <div class="section-kicker"><span>08</span> Field exam</div>
+        <div class="exam-heading">
+          <div><h2>Can you reason from the wire?</h2><p>Eight scenarios. No trivia. Choose the action that preserves ownership and protocol truth.</p></div>
+          <div class="score-dial" id="score-dial"><strong id="score-value">—</strong><span>/ 8</span></div>
+        </div>
+
+        <form class="quiz" id="quiz-form">
+          <fieldset class="quiz-card" data-answer="b">
+            <legend><span>01</span>Vibe emits three replay updates, then returns <code>session/load</code>. When may the UI publish history?</legend>
+            <label><input type="radio" name="q1" value="a" /> Immediately after the first update</label>
+            <label><input type="radio" name="q1" value="b" /> After the load succeeds and the reducer has applied through the captured barrier</label>
+            <label><input type="radio" name="q1" value="c" /> As soon as the load response is decoded</label>
+            <p class="quiz-explanation"></p>
+          </fieldset>
+          <fieldset class="quiz-card" data-answer="c">
+            <legend><span>02</span>An ACP agent does not advertise <code>loadSession</code>. What should the client do?</legend>
+            <label><input type="radio" name="q2" value="a" /> Try <code>session/load</code> and interpret the error</label>
+            <label><input type="radio" name="q2" value="b" /> Infer support from the agent name</label>
+            <label><input type="radio" name="q2" value="c" /> Hide or disable resume because optional behavior is capability-gated</label>
+            <p class="quiz-explanation"></p>
+          </fieldset>
+          <fieldset class="quiz-card" data-answer="a">
+            <legend><span>03</span>What is the cleanest distinction between ACP and MCP?</legend>
+            <label><input type="radio" name="q3" value="a" /> ACP connects client to agent; MCP connects agent/model to tools and data</label>
+            <label><input type="radio" name="q3" value="b" /> ACP is local and MCP is remote</label>
+            <label><input type="radio" name="q3" value="c" /> ACP streams while MCP cannot</label>
+            <p class="quiz-explanation"></p>
+          </fieldset>
+          <fieldset class="quiz-card" data-answer="c">
+            <legend><span>04</span><code>session/new</code> returns an ID on Vibe 2.21.0. May LeChaton persist it immediately?</legend>
+            <label><input type="radio" name="q4" value="a" /> Yes, the response is a durability guarantee</label>
+            <label><input type="radio" name="q4" value="b" /> Yes, after a hidden prompt forces storage</label>
+            <label><input type="radio" name="q4" value="c" /> No; wait for a visible prompt and exact <code>session/list</code> confirmation</label>
+            <p class="quiz-explanation"></p>
+          </fieldset>
+          <fieldset class="quiz-card" data-answer="b">
+            <legend><span>05</span>A cancel response arrives, but a verified shell descendant is still running. Is cancellation complete?</legend>
+            <label><input type="radio" name="q5" value="a" /> Yes, protocol completion is sufficient</label>
+            <label><input type="radio" name="q5" value="b" /> No, the runtime owner must prove its tracked process tree is gone</label>
+            <label><input type="radio" name="q5" value="c" /> Only if stdout has closed</label>
+            <p class="quiz-explanation"></p>
+          </fieldset>
+          <fieldset class="quiz-card" data-answer="a">
+            <legend><span>06</span>Which comparison best explains Pi’s design value?</legend>
+            <label><input type="radio" name="q6" value="a" /> A small harness with visible extension seams makes the loop easy to study and reshape</label>
+            <label><input type="radio" name="q6" value="b" /> It is an ACP specification implementation</label>
+            <label><input type="radio" name="q6" value="c" /> It removes the need for a model provider</label>
+            <p class="quiz-explanation"></p>
+          </fieldset>
+          <fieldset class="quiz-card" data-answer="c">
+            <legend><span>07</span>Why are Codex’s sandbox and approval policy separate controls?</legend>
+            <label><input type="radio" name="q7" value="a" /> One is for cloud and one is for local runs</label>
+            <label><input type="radio" name="q7" value="b" /> They are aliases retained for compatibility</label>
+            <label><input type="radio" name="q7" value="c" /> The sandbox limits what execution can touch; approval decides when the human must consent</label>
+            <p class="quiz-explanation"></p>
+          </fieldset>
+          <fieldset class="quiz-card" data-answer="b">
+            <legend><span>08</span>A known enum gains a new upstream value. What is the resilient client behavior?</legend>
+            <label><input type="radio" name="q8" value="a" /> Crash to surface incompatibility immediately</label>
+            <label><input type="radio" name="q8" value="b" /> Preserve it as unknown, degrade safely, and diagnose without inventing semantics</label>
+            <label><input type="radio" name="q8" value="c" /> Map it to the closest known case</label>
+            <p class="quiz-explanation"></p>
+          </fieldset>
+          <button class="button button-primary submit-exam" type="submit">Score my field exam <span>↗</span></button>
+        </form>
+      </section>
+
+      <section class="sources-section" id="sources">
+        <div class="sources-intro"><p class="eyebrow"><span>SOURCE DESK</span> PRIMARY REFERENCES</p><h2>Keep the model current.</h2><p>This manual separates stable concepts, current upstream documentation, and LeChaton’s pinned compatibility evidence. Re-check upstream sources before supporting a new version.</p></div>
+        <div class="source-columns">
+          <div><h3>Vibe</h3><a href="https://docs.mistral.ai/vibe/code/cli/work-with-cli" target="_blank" rel="noreferrer">Work with the CLI ↗</a><a href="https://docs.mistral.ai/vibe/code/cli/commands-shortcuts" target="_blank" rel="noreferrer">Commands & shortcuts ↗</a><a href="https://github.com/mistralai/mistral-vibe" target="_blank" rel="noreferrer">Source repository ↗</a></div>
+          <div><h3>ACP</h3><a href="https://agentclientprotocol.com/get-started/architecture" target="_blank" rel="noreferrer">Architecture ↗</a><a href="https://github.com/agentclientprotocol/agent-client-protocol" target="_blank" rel="noreferrer">Protocol & schemas ↗</a><a href="https://agentclientprotocol.com/get-started/registry" target="_blank" rel="noreferrer">Agent registry ↗</a></div>
+          <div><h3>Codex & Pi</h3><a href="https://learn.chatgpt.com/docs/developer-commands?surface=cli" target="_blank" rel="noreferrer">Codex CLI reference ↗</a><a href="https://learn.chatgpt.com/docs/agent-approvals-security" target="_blank" rel="noreferrer">Codex safety model ↗</a><a href="https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent" target="_blank" rel="noreferrer">Pi coding agent ↗</a></div>
+          <div><h3>LeChaton</h3><a href="../docs/hackathon-plan.md">Implementation plan ↗</a><a href="../docs/compatibility/vibe-2.21.0-live-gate.md">Live gate evidence ↗</a><a href="../docs/vibe-acp-issues.md">Vibe ACP issue register ↗</a><a href="../docs/adr/0004-external-integration-boundaries.md">Integration ADR ↗</a></div>
+        </div>
+      </section>
+
+      <footer>
+        <a class="brand footer-brand" href="#top"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 44 44"><path d="M8 14 14 7l5 7h6l5-7 6 7v16c0 4-3 7-7 7H15c-4 0-7-3-7-7V14Z"/><path d="M15 23h3m8 0h3m-12 7h10"/></svg></span><span><strong>Agent</strong><small>field manual</small></span></a>
+        <p>Built as a learning companion for LeChaton. Last source review: 19 July 2026.</p>
+        <a href="#top">Back to top ↑</a>
+      </footer>
+    </main>
+
+    <dialog class="command-dialog" id="command-dialog">
+      <div class="command-search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></svg>
+        <input id="command-input" type="search" placeholder="Search chapters, concepts, or commands…" autocomplete="off" />
+        <kbd>ESC</kbd>
+      </div>
+      <div class="command-results" id="command-results"></div>
+      <p class="command-hint"><span>↑↓ Navigate</span><span>↵ Open</span><span>Search covers the field manual</span></p>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite">Copied to clipboard</div>
+  </body>
+</html>
