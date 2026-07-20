@@ -12,7 +12,20 @@ python3 -m http.server 4173
 
 Then open [http://localhost:4173/website/](http://localhost:4173/website/). Serving the repository root keeps the manual's links to local source files and architecture documents navigable.
 
-The site has no package dependencies or build step. Lab progress, exam score, and the selected color theme are stored in browser local storage.
+The local site has no package dependencies. Lab progress, exam score, and the selected color theme are stored in browser local storage.
+
+## OpenAI Sites
+
+Build and validate the production worker package:
+
+```sh
+cd website
+npm run build
+npm run validate
+```
+
+The deployable output is written to `website/dist/` and is linked to the Sites
+project by `website/.openai/hosting.json`.
 
 ## Content scope
 
